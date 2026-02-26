@@ -14,4 +14,3 @@ dependencies = [
 
 [project.scripts]
 M0usuNet = "mousunet.cli:main"
-mousunet = "mousunet.cli:main"
