@@ -78,13 +78,19 @@ class MousuNetApp(App):
     def _refresh_conversations(self) -> None:
         with get_connection() as conn:
             convos = conversation_list(conn)
+
+        # Skip rebuild if nothing changed
         conv_list = self.query_one(ConversationList)
+        new_ids = [(c.contact_id, c.last_message) for c in convos]
+        if hasattr(self, "_last_conv_ids") and self._last_conv_ids == new_ids:
+            return
+        self._last_conv_ids = new_ids
+
         conv_list.set_conversations(convos)
 
         # Auto-select first conversation on initial load
         if not self._initial_select_done and convos:
             self._initial_select_done = True
-            # Force the Selected message since reactive won't fire for 0->0
             c = convos[0]
             conv_list.post_message(
                 ConversationList.Selected(c.contact_id, c.display_name, c.platform)
