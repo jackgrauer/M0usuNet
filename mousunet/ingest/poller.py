@@ -79,15 +79,13 @@ def poll_ipad() -> int:
     count = 0
     max_ts = since_ts
     for msg in messages:
-        if msg["is_from_me"]:
-            continue  # Only ingest inbound
-
         contact_id = _resolve_contact(msg["handle_id"])
         if contact_id is None:
             log.debug("No contact for handle %s, skipping", msg["handle_id"])
             continue
 
         platform = "imessage" if "imessage" in msg["service"] else "sms"
+        direction = "out" if msg["is_from_me"] else "in"
         guid = f"ipad:{msg['guid']}"
 
         with get_connection() as conn:
@@ -95,7 +93,7 @@ def poll_ipad() -> int:
                 conn,
                 contact_id=contact_id,
                 platform=platform,
-                direction="in",
+                direction=direction,
                 body=msg["text"],
                 sent_at=msg["sent_at_iso"],
                 external_guid=guid,
@@ -133,12 +131,14 @@ def poll_sync_bridge() -> int:
 
         guid = f"sync:{msg['guid']}"
 
+        direction = "out" if msg["is_from_me"] else "in"
+
         with get_connection() as conn:
             added = add_message_with_guid(
                 conn,
                 contact_id=contact_id,
                 platform=msg["platform"],
-                direction="in",
+                direction=direction,
                 body=msg["text"],
                 sent_at=msg["sent_at_iso"],
                 external_guid=guid,
@@ -169,20 +169,19 @@ def poll_pixel() -> int:
     count = 0
     max_ts = since_ms
     for msg in messages:
-        if msg['is_from_me']:
-            continue  # Only ingest inbound
-
         contact_id = _resolve_contact(msg['phone'])
         if contact_id is None:
             log.debug('No contact for phone %s, skipping', msg['phone'])
             continue
+
+        direction = 'out' if msg['is_from_me'] else 'in'
 
         with get_connection() as conn:
             added = add_message_with_guid(
                 conn,
                 contact_id=contact_id,
                 platform='sms',
-                direction='in',
+                direction=direction,
                 body=msg['text'],
                 sent_at=msg['sent_at_iso'],
                 external_guid=msg['guid'],

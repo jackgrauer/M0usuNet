@@ -40,7 +40,7 @@ def fetch_sync_messages(since_ms: int = 0) -> list[dict]:
         rows = conn.execute(
             "SELECT guid, chat_guid, sender, text, date_created, is_from_me "
             "FROM messages "
-            "WHERE is_from_me = 0 AND date_created > ? "
+            "WHERE date_created > ? "
             "ORDER BY date_created ASC LIMIT 500",
             (since_ms,),
         ).fetchall()
