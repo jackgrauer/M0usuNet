@@ -110,6 +110,21 @@ class ChatView(VerticalScroll):
         self.call_after_refresh(self.scroll_end, animate=False)
 
 
+class CopyButton(Static):
+    """Inline copy button that appears below a clicked message."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__("  \u25b8 copy to clipboard")
+        self._text = text
+
+    def on_click(self, event) -> None:
+        event.stop()
+        from ..clipboard import copy_osc52
+        copy_osc52(self._text)
+        self.app.notify("copied to clipboard", timeout=2)
+        self.remove()
+
+
 class MessageRow(Static):
     """A single message with direction-tinted sender labels."""
 
@@ -122,6 +137,8 @@ class MessageRow(Static):
     """
 
     def __init__(self, msg: Message, contact_name: str) -> None:
+        self._body = msg.body
+
         ts = ""
         if msg.sent_at:
             ts = msg.sent_at.strftime("%H:%M")
@@ -139,3 +156,11 @@ class MessageRow(Static):
             f"  {msg.body}"
         )
         super().__init__(markup)
+
+    def on_click(self, event) -> None:
+        event.stop()
+        # Remove any existing copy buttons in the chat
+        for btn in self.screen.query(CopyButton):
+            btn.remove()
+        # Mount copy button right after this message
+        self.parent.mount(CopyButton(self._body), after=self)

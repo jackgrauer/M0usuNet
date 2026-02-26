@@ -43,15 +43,14 @@ HeaderBar #mesh-status {
 /* ── Left panel: conversation list ── */
 
 ConversationList {
-    width: 32;
-    border-right: heavy #00d4ff;
-    border-top: heavy #00d4ff;
+    height: 10;
+    border-bottom: heavy #00d4ff;
     padding: 0;
     background: #0a0a0a;
 }
 
 ConversationItem {
-    height: 3;
+    height: 2;
     padding: 0 1;
     background: #0a0a0a;
     color: #e0e0e0;
@@ -77,10 +76,7 @@ ConversationItem.--highlight {
 
 /* ── Right panel: chat view ── */
 
-#right-panel {
-    background: #0a0a0a;
-    border-top: heavy #00d4ff;
-}
+
 
 ChatView {
     padding: 0 1;
@@ -139,4 +135,20 @@ ComposeBox .success {
     color: #555555;
     text-align: center;
     padding-top: 3;
+}
+
+/* ── Copy popup ── */
+
+CopyButton {
+    height: 1;
+    padding: 0 2;
+    background: #1a2a3a;
+    color: #00d4ff;
+    text-align: right;
+    text-style: bold;
+}
+
+CopyButton:hover {
+    background: #223344;
+    color: #ffffff;
 }

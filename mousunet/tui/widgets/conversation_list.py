@@ -117,7 +117,7 @@ class ConversationItem(Widget):
 
     DEFAULT_CSS = """
     ConversationItem {
-        height: 3;
+        height: 2;
         padding: 0 1;
     }
     ConversationItem.--highlight {

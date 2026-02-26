@@ -60,11 +60,9 @@ class MousuNetApp(App):
 
     def compose(self) -> ComposeResult:
         yield HeaderBar()
-        with Horizontal():
-            yield ConversationList()
-            with Vertical(id="right-panel"):
-                yield ChatView()
-                yield ComposeBox()
+        yield ConversationList()
+        yield ChatView()
+        yield ComposeBox()
 
     def on_mount(self) -> None:
         ensure_schema()
