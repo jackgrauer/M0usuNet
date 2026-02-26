@@ -54,6 +54,7 @@ class ChatView(VerticalScroll):
         super().__init__()
         self._contact_name: str = ""
         self._platform: str = ""
+        self._messages_data: list[tuple[str, str, str]] = []
         self.border_title = "╸ SELECT A NODE ╺"
 
     def set_messages(
@@ -62,6 +63,7 @@ class ChatView(VerticalScroll):
         self._contact_name = contact_name
         self._platform = platform
         self._update_title()
+        self._messages_data: list[tuple[str, str, str]] = []
         self.remove_children()
         if not messages:
             self.mount(Static("no messages yet", classes="empty-state"))
@@ -73,6 +75,8 @@ class ChatView(VerticalScroll):
             if msg_date and msg_date != last_date:
                 self.mount(DateSeparator(_date_label(msg_date)))
                 last_date = msg_date
+            sender = "you" if msg.direction == "out" else contact_name
+            self._messages_data.append((msg.direction, sender, msg.body))
             self.mount(MessageRow(msg, contact_name))
 
         self.call_after_refresh(self.scroll_end, animate=False)
@@ -86,6 +90,16 @@ class ChatView(VerticalScroll):
         self.border_title = (
             f"╸ {self._contact_name.upper()} // {platform_upper} // {device} ╺"
         )
+
+    def get_messages_text(self) -> list[tuple[str, str, str]]:
+        """Return list of (direction, sender, body) for all messages."""
+        return list(self._messages_data)
+
+    def get_last_message_body(self) -> str:
+        """Return body of the last message, or empty string."""
+        if self._messages_data:
+            return self._messages_data[-1][2]
+        return ""
 
     def append_message(self, msg: Message) -> None:
         for child in self.children:

@@ -24,6 +24,7 @@ from .widgets.conversation_list import ConversationList
 from .widgets.chat_view import ChatView
 from .widgets.compose_box import ComposeBox
 from .widgets.header_bar import HeaderBar
+from .clipboard import copy_osc52
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +46,8 @@ class MousuNetApp(App):
         Binding("escape", "escape", "Escape", show=False),
         Binding("n", "new_message", "New message", show=False),
         Binding("d", "delete_conversation", "Delete", show=False),
-        Binding("c", "copy_conversation", "Copy", show=False),
+        Binding("ctrl+c", "copy_last", "Copy", show=False),
+        Binding("ctrl+a", "select_all", "Select all", show=False),
         Binding("q", "quit", "Quit", show=False),
     ]
 
@@ -156,6 +158,31 @@ class MousuNetApp(App):
             compose.show_status(f"◉ RELAY OK  {output}")
         else:
             compose.show_status(f"◉ RELAY FAIL  {output}", error=True)
+
+    def action_copy_last(self) -> None:
+        """Copy last message body to clipboard via OSC 52."""
+        focused = self.focused
+        if focused and focused.id == "compose-input":
+            # If in compose input, copy the input value
+            inp = self.query_one("#compose-input", Input)
+            if inp.value:
+                copy_osc52(inp.value)
+                self.query_one(ComposeBox).show_status("copied to clipboard")
+            return
+        chat = self.query_one(ChatView)
+        body = chat.get_last_message_body()
+        if body:
+            copy_osc52(body)
+            self.query_one(ComposeBox).show_status("copied to clipboard")
+
+    def action_select_all(self) -> None:
+        """Select all text in compose input."""
+        try:
+            inp = self.query_one("#compose-input", Input)
+            inp.selection = inp.Selection(0, len(inp.value))
+            inp.focus()
+        except Exception:
+            pass
 
     def action_conv_up(self) -> None:
         focused = self.focused
