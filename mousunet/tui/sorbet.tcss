@@ -1,0 +1,142 @@
+/* DedSec theme for MousuNet */
+
+Screen {
+    background: #0a0a0a;
+    color: #e0e0e0;
+}
+
+/* ── Header bar ── */
+
+HeaderBar {
+    height: 3;
+    dock: top;
+    background: #0d0d0d;
+    border-bottom: heavy #00d4ff;
+    padding: 0 1;
+    color: #e0e0e0;
+}
+
+HeaderBar Horizontal {
+    height: 1;
+    width: 100%;
+}
+
+HeaderBar #app-title {
+    color: #00d4ff;
+    text-style: bold;
+    width: auto;
+}
+
+HeaderBar #clock {
+    color: #555555;
+    width: auto;
+    dock: right;
+}
+
+HeaderBar #mesh-status {
+    color: #e0e0e0;
+    width: auto;
+    content-align: center middle;
+    margin: 0 2;
+}
+
+/* ── Left panel: conversation list ── */
+
+ConversationList {
+    width: 32;
+    border-right: heavy #00d4ff;
+    border-top: heavy #00d4ff;
+    padding: 0;
+    background: #0a0a0a;
+}
+
+ConversationItem {
+    height: 3;
+    padding: 0 1;
+    background: #0a0a0a;
+    color: #e0e0e0;
+}
+
+ConversationItem.--highlight {
+    background: #111a22;
+    color: #00d4ff;
+}
+
+.conv-name {
+    color: #e0e0e0;
+    text-style: bold;
+}
+
+.--highlight .conv-name {
+    color: #00d4ff;
+}
+
+.conv-preview {
+    color: #555555;
+}
+
+/* ── Right panel: chat view ── */
+
+#right-panel {
+    background: #0a0a0a;
+    border-top: heavy #00d4ff;
+}
+
+ChatView {
+    padding: 0 1;
+    background: #0a0a0a;
+}
+
+/* ── Bottom: compose box ── */
+
+ComposeBox {
+    height: auto;
+    max-height: 5;
+    dock: bottom;
+    border-top: heavy #00d4ff;
+    padding: 0 1;
+    background: #0d0d0d;
+}
+
+ComposeBox Horizontal {
+    height: 1;
+    width: 100%;
+}
+
+#compose-prompt {
+    color: #00d4ff;
+    text-style: bold;
+    width: 3;
+}
+
+ComposeBox Input {
+    background: #111111;
+    color: #e0e0e0;
+    border: none;
+    width: 1fr;
+}
+
+ComposeBox Input:focus {
+    border: none;
+}
+
+#relay-status {
+    height: auto;
+    max-height: 1;
+}
+
+ComposeBox .error {
+    color: #f75341;
+}
+
+ComposeBox .success {
+    color: #50fa7b;
+}
+
+/* ── Empty state ── */
+
+.empty-state {
+    color: #555555;
+    text-align: center;
+    padding-top: 3;
+}

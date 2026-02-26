@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mousunet"
+version = "0.1.0"
+description = "Unified messaging TUI"
+requires-python = ">=3.11"
+dependencies = [
+    "textual>=0.89",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+mousunet = "mousunet.cli:main"
