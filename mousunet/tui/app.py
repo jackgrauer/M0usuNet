@@ -46,8 +46,7 @@ class MousuNetApp(App):
         Binding("escape", "escape", "Escape", show=False),
         Binding("n", "new_message", "New message", show=False),
         Binding("d", "delete_conversation", "Delete", show=False),
-        Binding("ctrl+c", "copy_last", "Copy", show=False),
-        Binding("ctrl+a", "select_all", "Select all", show=False),
+        Binding("y", "copy_last", "Yank", show=False),
         Binding("q", "quit", "Quit", show=False),
     ]
 
