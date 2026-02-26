@@ -73,7 +73,7 @@ class MousuNetApp(App):
             from ..ingest.poller import start_background
             self._ingest_thread = start_background(interval=30)
         except Exception as e:
-            log.warning("Ingest poller failed to start: %s", e)
+            log.info("Ingest poller not started (normal on Mac): %s", e)
 
     def _refresh_conversations(self) -> None:
         with get_connection() as conn:

@@ -1,12 +1,15 @@
 """Paths, colors, and defaults."""
 
+import os
 from pathlib import Path
 
-# Database
-DB_PATH = Path.home() / "mousunet.db"
+# Database — override with MOUSUNET_DB env var
+DB_PATH = Path(os.environ.get("MOUSUNET_DB", str(Path.home() / "mousunet.db")))
 
-# Relay
-RELAY_PATH = Path.home() / "relay.sh"
+# Relay — override with MOUSUNET_RELAY env var
+# Pi: ~/relay.sh (local)
+# Mac: ~/bin/msg (routes through Pi)
+RELAY_PATH = Path(os.environ.get("MOUSUNET_RELAY", str(Path.home() / "relay.sh")))
 
 # Contacts
 CONTACTS_TSV = Path.home() / "contacts.tsv"
@@ -27,4 +30,4 @@ class Color:
     MAGENTA = "#ff2d6f"    # notifications, dating tags
     ORANGE = "#ff8c00"     # alerts
     RED = "#f75341"        # errors
-    DIM_CYAN = "#1a5c7a"  # timestamps, ticker
+    DIM_CYAN = "#1a5c7a"   # timestamps, ticker
