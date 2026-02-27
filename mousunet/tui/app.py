@@ -38,6 +38,7 @@ class MousuNetApp(App):
     BINDINGS = [
         Binding("tab", "toggle_focus", "Toggle focus", show=False),
         Binding("escape", "escape", "Escape", show=False),
+        Binding("d", "delete_conversation", "Delete", show=False),
     ]
 
     def __init__(self) -> None:
@@ -123,6 +124,83 @@ class MousuNetApp(App):
             phone=getattr(self, "_current_phone", ""),
         )
 
+    # ── New Message modal ──────────────────────────────────
+
+    def on_conversation_list_new_message_requested(self) -> None:
+        self.push_screen(NewMessageScreen(), callback=self._on_new_message_done)
+
+    def _on_new_message_done(self, contact_id: int | None) -> None:
+        if contact_id is None:
+            return
+        # Refresh sidebar so new/existing contact appears
+        self._last_conv_ids = None  # force rebuild
+        self._refresh_conversations()
+        # Try to select the contact in the sidebar
+        conv_list = self.query_one(ConversationList)
+        for i, c in enumerate(conv_list._conversations):
+            if c.contact_id == contact_id:
+                conv_list.selected_index = i
+                return
+        # Contact exists but has no messages yet — load empty chat directly
+        with get_connection() as conn:
+            contact = get_contact(conn, contact_id)
+        if contact:
+            self._current_contact_id = contact_id
+            self._current_contact_name = contact.display_name
+            self._current_platform = ""
+            self._current_phone = contact.phone or ""
+            self._last_msg_count = 0
+            chat = self.query_one(ChatView)
+            chat.set_messages([], contact.display_name, "", phone=contact.phone or "")
+            compose = self.query_one(ComposeBox)
+            compose.set_contact_name(contact.display_name)
+            compose.clear_status()
+
+    # ── Delete Conversation modal ─────────────────────────
+
+    def action_delete_conversation(self) -> None:
+        if self._current_contact_id is None:
+            return
+        with get_connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt FROM messages WHERE contact_id = ?",
+                (self._current_contact_id,),
+            ).fetchone()
+            count = row["cnt"] if row else 0
+        self.push_screen(
+            ConfirmDeleteScreen(self._current_contact_name, count),
+            callback=self._on_delete_confirmed,
+        )
+
+    def _on_delete_confirmed(self, confirmed: bool) -> None:
+        if not confirmed:
+            return
+        with get_connection() as conn:
+            delete_messages_for_contact(conn, self._current_contact_id)
+        self._current_contact_id = None
+        self._current_contact_name = ""
+        self._current_platform = ""
+        self._current_phone = ""
+        self._last_msg_count = 0
+        self._last_conv_ids = None  # force sidebar rebuild
+        self._refresh_conversations()
+        chat = self.query_one(ChatView)
+        chat.set_messages([], "", "")
+
+    # ── Tab styling helper ────────────────────────────────
+
+    def _update_tabs(self, active: str) -> None:
+        """Toggle --active class on the main HeaderBar's tab buttons."""
+        header = self.query_one(HeaderBar)
+        for tab_id in ("tab-messages", "tab-editor"):
+            try:
+                btn = header.query_one(f"#{tab_id}")
+                btn.set_class(tab_id == f"tab-{active}", "--active")
+            except Exception:
+                pass
+
+    # ── Compose / send ────────────────────────────────────
+
     def on_compose_box_submitted(self, event: ComposeBox.Submitted) -> None:
         if self._current_contact_id is None:
             return
@@ -145,14 +223,17 @@ class MousuNetApp(App):
 
         screen = ReplyEditorScreen(context_lines, contact_name)
         self.push_screen(screen, callback=self._on_reply_editor_done)
+        self._update_tabs("editor")
 
     def action_show_messages(self) -> None:
         """Pop back to the main messages screen."""
         if isinstance(self.screen, ReplyEditorScreen):
             self.screen.dismiss("")
+        self._update_tabs("messages")
 
     def _on_reply_editor_done(self, result: str) -> None:
         """Called when reply editor screen is dismissed."""
+        self._update_tabs("messages")
         if result:
             self._send_body(result)
 

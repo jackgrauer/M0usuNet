@@ -12,6 +12,7 @@ import time
 from typing import Callable
 
 from ..db.connection import get_connection
+from ..db.contacts import upsert_contact
 from ..db.messages import add_message_with_guid
 from .ipad import fetch_ipad_messages
 from .sync_bridge import fetch_sync_messages
@@ -67,7 +68,10 @@ def _resolve_contact(phone: str) -> int | None:
             ).fetchone()
             if row:
                 return row["id"]
-    return None
+        # Auto-create contact using phone number as display name
+        new_id = upsert_contact(conn, normalized, normalized)
+        log.info("Auto-created contact for %s (id=%d)", normalized, new_id)
+        return new_id
 
 
 def poll_ipad(inbound: list[tuple[int, str]] | None = None) -> int:
