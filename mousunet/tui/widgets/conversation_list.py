@@ -55,11 +55,12 @@ class ConversationList(VerticalScroll):
     class Selected(TMessage):
         """Fired when a conversation is selected."""
 
-        def __init__(self, contact_id: int, display_name: str, platform: str = "sms") -> None:
+        def __init__(self, contact_id: int, display_name: str, platform: str = "sms", phone: str = "") -> None:
             super().__init__()
             self.contact_id = contact_id
             self.display_name = display_name
             self.platform = platform
+            self.phone = phone
 
     class NewMessageRequested(TMessage):
         """Fired when the user wants to start a new conversation."""
@@ -95,7 +96,7 @@ class ConversationList(VerticalScroll):
         self._highlight()
         if self._conversations and 0 <= self.selected_index < len(self._conversations):
             c = self._conversations[self.selected_index]
-            self.post_message(self.Selected(c.contact_id, c.display_name, c.platform))
+            self.post_message(self.Selected(c.contact_id, c.display_name, c.platform, c.phone or ""))
 
     def action_up(self) -> None:
         if self.selected_index > 0:

@@ -9,6 +9,14 @@ from textual.widget import Widget
 from textual.widgets import Input, Static
 
 
+class ReplyButton(Static):
+    """Clickable button that opens the reply editor."""
+
+    def on_click(self, event) -> None:
+        event.stop()
+        self.app.action_reply_editor()
+
+
 class ComposeBox(Widget):
     """Reply input that fires a Submitted message."""
 
@@ -26,7 +34,8 @@ class ComposeBox(Widget):
 
     def compose(self) -> ComposeResult:
         with Horizontal():
-            yield Static("▸ ", id="compose-prompt")
+            yield ReplyButton(" REPLY ", id="reply-btn")
+            yield Static(" ▸ ", id="compose-prompt")
             yield Input(placeholder=self._placeholder, id="compose-input")
         yield self._status
 

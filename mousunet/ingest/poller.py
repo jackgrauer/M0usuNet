@@ -6,6 +6,7 @@ thread started by the TUI on mount.
 
 import logging
 import re
+import subprocess
 import threading
 import time
 from typing import Callable
@@ -17,6 +18,8 @@ from .sync_bridge import fetch_sync_messages
 from .pixel import fetch_pixel_messages
 
 log = logging.getLogger(__name__)
+
+NTFY_TOPIC = "jack-mesh-alerts"
 
 POLL_INTERVAL = 30  # seconds
 
@@ -67,8 +70,11 @@ def _resolve_contact(phone: str) -> int | None:
     return None
 
 
-def poll_ipad() -> int:
-    """Poll iPad SMS.db for new messages. Returns count ingested."""
+def poll_ipad(inbound: list[tuple[int, str]] | None = None) -> int:
+    """Poll iPad SMS.db for new messages. Returns count ingested.
+
+    If inbound list is provided, appends (contact_id, body) for each new inbound message.
+    """
     state = _get_sync_state("ipad")
     since_ts = int(state) if state else 0
 
@@ -78,17 +84,17 @@ def poll_ipad() -> int:
 
     count = 0
     max_ts = since_ts
-    for msg in messages:
-        contact_id = _resolve_contact(msg["handle_id"])
-        if contact_id is None:
-            log.debug("No contact for handle %s, skipping", msg["handle_id"])
-            continue
+    with get_connection() as conn:
+        for msg in messages:
+            contact_id = _resolve_contact(msg["handle_id"])
+            if contact_id is None:
+                log.debug("No contact for handle %s, skipping", msg["handle_id"])
+                continue
 
-        platform = "imessage" if "imessage" in msg["service"] else "sms"
-        direction = "out" if msg["is_from_me"] else "in"
-        guid = f"ipad:{msg['guid']}"
+            platform = "imessage" if "imessage" in msg["service"] else "sms"
+            direction = "out" if msg["is_from_me"] else "in"
+            guid = f"ipad:{msg['guid']}"
 
-        with get_connection() as conn:
             added = add_message_with_guid(
                 conn,
                 contact_id=contact_id,
@@ -98,11 +104,13 @@ def poll_ipad() -> int:
                 sent_at=msg["sent_at_iso"],
                 external_guid=guid,
             )
-        if added:
-            count += 1
+            if added:
+                count += 1
+                if direction == "in" and inbound is not None:
+                    inbound.append((contact_id, msg["text"]))
 
-        if msg["apple_date"] > max_ts:
-            max_ts = msg["apple_date"]
+            if msg["apple_date"] > max_ts:
+                max_ts = msg["apple_date"]
 
     if max_ts > since_ts:
         _set_sync_state("ipad", str(max_ts))
@@ -112,7 +120,7 @@ def poll_ipad() -> int:
     return count
 
 
-def poll_sync_bridge() -> int:
+def poll_sync_bridge(inbound: list[tuple[int, str]] | None = None) -> int:
     """Poll imessage-sync messages.db for new messages. Returns count ingested."""
     state = _get_sync_state("imessage-sync")
     since_ms = int(state) if state else 0
@@ -123,17 +131,16 @@ def poll_sync_bridge() -> int:
 
     count = 0
     max_ms = since_ms
-    for msg in messages:
-        contact_id = _resolve_contact(msg["sender"])
-        if contact_id is None:
-            log.debug("No contact for sender %s, skipping", msg["sender"])
-            continue
+    with get_connection() as conn:
+        for msg in messages:
+            contact_id = _resolve_contact(msg["sender"])
+            if contact_id is None:
+                log.debug("No contact for sender %s, skipping", msg["sender"])
+                continue
 
-        guid = f"sync:{msg['guid']}"
+            guid = f"sync:{msg['guid']}"
+            direction = "out" if msg["is_from_me"] else "in"
 
-        direction = "out" if msg["is_from_me"] else "in"
-
-        with get_connection() as conn:
             added = add_message_with_guid(
                 conn,
                 contact_id=contact_id,
@@ -143,11 +150,13 @@ def poll_sync_bridge() -> int:
                 sent_at=msg["sent_at_iso"],
                 external_guid=guid,
             )
-        if added:
-            count += 1
+            if added:
+                count += 1
+                if direction == "in" and inbound is not None:
+                    inbound.append((contact_id, msg["text"]))
 
-        if msg["date_created_ms"] > max_ms:
-            max_ms = msg["date_created_ms"]
+            if msg["date_created_ms"] > max_ms:
+                max_ms = msg["date_created_ms"]
 
     if max_ms > since_ms:
         _set_sync_state("imessage-sync", str(max_ms))
@@ -157,7 +166,7 @@ def poll_sync_bridge() -> int:
     return count
 
 
-def poll_pixel() -> int:
+def poll_pixel(inbound: list[tuple[int, str]] | None = None) -> int:
     """Poll Pixel Google Messages via ADB. Returns count ingested."""
     state = _get_sync_state('pixel')
     since_ms = int(state) if state else 0
@@ -168,15 +177,15 @@ def poll_pixel() -> int:
 
     count = 0
     max_ts = since_ms
-    for msg in messages:
-        contact_id = _resolve_contact(msg['phone'])
-        if contact_id is None:
-            log.debug('No contact for phone %s, skipping', msg['phone'])
-            continue
+    with get_connection() as conn:
+        for msg in messages:
+            contact_id = _resolve_contact(msg['phone'])
+            if contact_id is None:
+                log.debug('No contact for phone %s, skipping', msg['phone'])
+                continue
 
-        direction = 'out' if msg['is_from_me'] else 'in'
+            direction = 'out' if msg['is_from_me'] else 'in'
 
-        with get_connection() as conn:
             added = add_message_with_guid(
                 conn,
                 contact_id=contact_id,
@@ -186,11 +195,13 @@ def poll_pixel() -> int:
                 sent_at=msg['sent_at_iso'],
                 external_guid=msg['guid'],
             )
-        if added:
-            count += 1
+            if added:
+                count += 1
+                if direction == 'in' and inbound is not None:
+                    inbound.append((contact_id, msg['text']))
 
-        if msg['timestamp_ms'] > max_ts:
-            max_ts = msg['timestamp_ms']
+            if msg['timestamp_ms'] > max_ts:
+                max_ts = msg['timestamp_ms']
 
     if max_ts > since_ms:
         _set_sync_state('pixel', str(max_ts))
@@ -200,12 +211,50 @@ def poll_pixel() -> int:
     return count
 
 
-def poll_once() -> int:
+def _contact_name(contact_id: int) -> str:
+    """Look up display name for a contact id."""
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT display_name FROM contacts WHERE id = ?", (contact_id,)
+        ).fetchone()
+        return row["display_name"] if row else f"#{contact_id}"
+
+
+def _send_ntfy(title: str, body: str) -> None:
+    """Send a push notification via ntfy.sh (fire and forget)."""
+    try:
+        subprocess.run(
+            ["curl", "-s",
+             "-H", f"Title: {title}",
+             "-d", body,
+             f"https://ntfy.sh/{NTFY_TOPIC}"],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        log.debug("ntfy send failed", exc_info=True)
+
+
+def poll_once(notify: bool = True) -> int:
     """Run one poll cycle across all sources. Returns total ingested."""
+    inbound: list[tuple[int, str]] = []  # (contact_id, body)
     total = 0
-    total += poll_ipad()
-    total += poll_sync_bridge()
-    total += poll_pixel()
+    total += poll_ipad(inbound)
+    total += poll_sync_bridge(inbound)
+    total += poll_pixel(inbound)
+
+    if inbound and notify:
+        # Group by contact for concise notifications
+        by_contact: dict[int, list[str]] = {}
+        for cid, body in inbound:
+            by_contact.setdefault(cid, []).append(body)
+        for cid, bodies in by_contact.items():
+            name = _contact_name(cid)
+            preview = bodies[-1][:80]
+            count = len(bodies)
+            title = f"{name}" if count == 1 else f"{name} ({count})"
+            _send_ntfy(title, preview)
+
     return total
 
 

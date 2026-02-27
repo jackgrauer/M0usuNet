@@ -33,6 +33,33 @@ HeaderBar #clock {
     dock: right;
 }
 
+.tab-btn {
+    width: auto;
+    height: 1;
+    background: #1a1a1a;
+    color: #555555;
+    margin: 0 0 0 1;
+}
+
+.tab-btn:hover {
+    color: #e0e0e0;
+    background: #2a2a2a;
+}
+
+.tab-btn.--active {
+    text-style: bold;
+}
+
+#tab-messages.--active {
+    background: #1a3a1a;
+    color: #50fa7b;
+}
+
+#tab-editor.--active {
+    background: #1a1a2a;
+    color: #00d4ff;
+}
+
 HeaderBar #mesh-status {
     color: #e0e0e0;
     width: auto;
@@ -85,12 +112,24 @@ ChatView {
 
 /* ── Bottom: compose box ── */
 
+#reply-btn {
+    width: auto;
+    height: 1;
+    background: #1a3a1a;
+    color: #50fa7b;
+    text-style: bold;
+}
+
+#reply-btn:hover {
+    color: #0a0a0a;
+    background: #50fa7b;
+}
+
 ComposeBox {
     height: auto;
-    max-height: 5;
+    max-height: 2;
     dock: bottom;
-    border-top: heavy #00d4ff;
-    padding: 0 1;
+    padding: 0;
     background: #0d0d0d;
 }
 

@@ -7,7 +7,6 @@ from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
 from textual.widgets import Input
 
 from ..db.connection import ensure_schema, get_connection
@@ -19,12 +18,11 @@ from ..db.models import Message
 from ..exceptions import RelayError
 from ..relay.send import send_message
 
-from .screens import ConfirmDeleteScreen, NewMessageScreen
+from .screens import ConfirmDeleteScreen, NewMessageScreen, ReplyEditorScreen
 from .widgets.conversation_list import ConversationList
 from .widgets.chat_view import ChatView
 from .widgets.compose_box import ComposeBox
 from .widgets.header_bar import HeaderBar
-from .clipboard import copy_osc52
 
 log = logging.getLogger(__name__)
 
@@ -38,16 +36,8 @@ class MousuNetApp(App):
     CSS_PATH = CSS_PATH
 
     BINDINGS = [
-        Binding("k", "conv_up", "Up", show=False),
-        Binding("j", "conv_down", "Down", show=False),
-        Binding("up", "conv_up", "Up", show=False),
-        Binding("down", "conv_down", "Down", show=False),
         Binding("tab", "toggle_focus", "Toggle focus", show=False),
         Binding("escape", "escape", "Escape", show=False),
-        Binding("n", "new_message", "New message", show=False),
-        Binding("d", "delete_conversation", "Delete", show=False),
-        Binding("y", "copy_last", "Yank", show=False),
-        Binding("q", "quit", "Quit", show=False),
     ]
 
     def __init__(self) -> None:
@@ -78,8 +68,23 @@ class MousuNetApp(App):
     def _refresh_conversations(self) -> None:
         with get_connection() as conn:
             convos = conversation_list(conn)
+            # Check if active chat has new messages
+            current_msg_count = 0
+            if self._current_contact_id is not None:
+                row = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM messages WHERE contact_id = ?",
+                    (self._current_contact_id,),
+                ).fetchone()
+                current_msg_count = row["cnt"] if row else 0
 
-        # Skip rebuild if nothing changed
+        # Reload active chat if message count changed
+        if self._current_contact_id is not None:
+            prev = getattr(self, "_last_msg_count", 0)
+            if current_msg_count != prev:
+                self._last_msg_count = current_msg_count
+                self._load_chat()
+
+        # Skip sidebar rebuild if nothing changed
         conv_list = self.query_one(ConversationList)
         new_ids = [(c.contact_id, c.last_message) for c in convos]
         if hasattr(self, "_last_conv_ids") and self._last_conv_ids == new_ids:
@@ -100,6 +105,8 @@ class MousuNetApp(App):
         self._current_contact_id = event.contact_id
         self._current_contact_name = event.display_name
         self._current_platform = event.platform
+        self._current_phone = event.phone
+        self._last_msg_count = 0  # reset so _load_chat runs fresh
         self._load_chat()
         compose = self.query_one(ComposeBox)
         compose.set_contact_name(event.display_name)
@@ -111,13 +118,48 @@ class MousuNetApp(App):
         with get_connection() as conn:
             msgs = get_messages(conn, self._current_contact_id)
         chat = self.query_one(ChatView)
-        chat.set_messages(msgs, self._current_contact_name, self._current_platform)
+        chat.set_messages(
+            msgs, self._current_contact_name, self._current_platform,
+            phone=getattr(self, "_current_phone", ""),
+        )
 
     def on_compose_box_submitted(self, event: ComposeBox.Submitted) -> None:
         if self._current_contact_id is None:
             return
+        self._send_body(event.body)
 
-        body = event.body
+    def action_reply_editor(self) -> None:
+        """Open reply editor screen with message context."""
+        # Don't stack multiple editor screens
+        if isinstance(self.screen, ReplyEditorScreen):
+            return
+        if self._current_contact_id is None:
+            return
+
+        chat = self.query_one(ChatView)
+        contact_name = self._current_contact_name
+
+        context_lines = []
+        for direction, sender, body in chat.get_messages_text()[-10:]:
+            context_lines.append(f"{sender}: {body}")
+
+        screen = ReplyEditorScreen(context_lines, contact_name)
+        self.push_screen(screen, callback=self._on_reply_editor_done)
+
+    def action_show_messages(self) -> None:
+        """Pop back to the main messages screen."""
+        if isinstance(self.screen, ReplyEditorScreen):
+            self.screen.dismiss("")
+
+    def _on_reply_editor_done(self, result: str) -> None:
+        """Called when reply editor screen is dismissed."""
+        if result:
+            self._send_body(result)
+
+    def _send_body(self, body: str) -> None:
+        """Send a message body to the current contact."""
+        if self._current_contact_id is None:
+            return
         contact_name = self._current_contact_name
         contact_id = self._current_contact_id
         compose = self.query_one(ComposeBox)
@@ -129,28 +171,18 @@ class MousuNetApp(App):
             output = str(e)
             success = False
 
-        # Detect platform from relay output
         platform = "sms"
         if "imessage" in output.lower() or "imsg" in output.lower():
             platform = "imessage"
 
         with get_connection() as conn:
             mid = add_message(
-                conn,
-                contact_id,
-                platform,
-                "out",
-                body,
-                delivered=success,
-                relay_output=output,
+                conn, contact_id, platform, "out", body,
+                delivered=success, relay_output=output,
             )
             msg = Message(
-                id=mid,
-                contact_id=contact_id,
-                platform=platform,
-                direction="out",
-                body=body,
-                delivered=success,
+                id=mid, contact_id=contact_id, platform=platform,
+                direction="out", body=body, delivered=success,
                 relay_output=output,
             )
 
@@ -161,43 +193,6 @@ class MousuNetApp(App):
             compose.show_status(f"◉ RELAY OK  {output}")
         else:
             compose.show_status(f"◉ RELAY FAIL  {output}", error=True)
-
-    def action_copy_last(self) -> None:
-        """Copy last message body to clipboard via OSC 52."""
-        focused = self.focused
-        if focused and focused.id == "compose-input":
-            # If in compose input, copy the input value
-            inp = self.query_one("#compose-input", Input)
-            if inp.value:
-                copy_osc52(inp.value)
-                self.query_one(ComposeBox).show_status("copied to clipboard")
-            return
-        chat = self.query_one(ChatView)
-        body = chat.get_last_message_body()
-        if body:
-            copy_osc52(body)
-            self.query_one(ComposeBox).show_status("copied to clipboard")
-
-    def action_select_all(self) -> None:
-        """Select all text in compose input."""
-        try:
-            inp = self.query_one("#compose-input", Input)
-            inp.selection = inp.Selection(0, len(inp.value))
-            inp.focus()
-        except Exception:
-            pass
-
-    def action_conv_up(self) -> None:
-        focused = self.focused
-        if focused and focused.id == "compose-input":
-            return
-        self.query_one(ConversationList).action_up()
-
-    def action_conv_down(self) -> None:
-        focused = self.focused
-        if focused and focused.id == "compose-input":
-            return
-        self.query_one(ConversationList).action_down()
 
     def action_toggle_focus(self) -> None:
         """Toggle focus between compose input and conversation list."""

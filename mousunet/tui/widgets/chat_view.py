@@ -18,17 +18,16 @@ DEVICE_MAP = {
 
 
 def _date_label(d: date) -> str:
-    """Human-friendly date label."""
+    """Human-friendly date label with day of week and date."""
     today = date.today()
     delta = (today - d).days
+    weekday = d.strftime("%A")  # e.g. "Tuesday"
     if delta == 0:
-        return "Today"
+        return f"Today — {weekday}, {d.strftime('%b %d')}"
     elif delta == 1:
-        return "Yesterday"
-    elif delta < 7:
-        return d.strftime("%A")  # e.g. "Tuesday"
+        return f"Yesterday — {weekday}, {d.strftime('%b %d')}"
     else:
-        return d.strftime("%b %d")  # e.g. "Feb 24"
+        return f"{weekday}, {d.strftime('%b %d')}"
 
 
 class DateSeparator(Static):
@@ -53,14 +52,17 @@ class ChatView(VerticalScroll):
     def __init__(self) -> None:
         super().__init__()
         self._contact_name: str = ""
+        self._contact_phone: str = ""
         self._platform: str = ""
         self._messages_data: list[tuple[str, str, str]] = []
         self.border_title = "╸ SELECT A NODE ╺"
 
     def set_messages(
-        self, messages: list[Message], contact_name: str, platform: str = ""
+        self, messages: list[Message], contact_name: str, platform: str = "",
+        phone: str = "",
     ) -> None:
         self._contact_name = contact_name
+        self._contact_phone = phone
         self._platform = platform
         self._update_title()
         self._messages_data: list[tuple[str, str, str]] = []
@@ -69,12 +71,7 @@ class ChatView(VerticalScroll):
             self.mount(Static("no messages yet", classes="empty-state"))
             return
 
-        last_date: date | None = None
         for msg in messages:
-            msg_date = msg.sent_at.date() if msg.sent_at else None
-            if msg_date and msg_date != last_date:
-                self.mount(DateSeparator(_date_label(msg_date)))
-                last_date = msg_date
             sender = "you" if msg.direction == "out" else contact_name
             self._messages_data.append((msg.direction, sender, msg.body))
             self.mount(MessageRow(msg, contact_name))
@@ -87,8 +84,9 @@ class ChatView(VerticalScroll):
             return
         platform_upper = self._platform.upper() if self._platform else "???"
         device = DEVICE_MAP.get(self._platform, "RELAY")
+        phone = self._contact_phone or ""
         self.border_title = (
-            f"╸ {self._contact_name.upper()} // {platform_upper} // {device} ╺"
+            f"╸ {self._contact_name.upper()} {phone} // {platform_upper} // {device} ╺"
         )
 
     def get_messages_text(self) -> list[tuple[str, str, str]]:
@@ -141,7 +139,7 @@ class MessageRow(Static):
 
         ts = ""
         if msg.sent_at:
-            ts = msg.sent_at.strftime("%H:%M")
+            ts = msg.sent_at.strftime("%-I:%M %p %a, %b %-d %Y").upper()  # e.g. "6:30 AM TUE, FEB 27 2026"
 
         if msg.direction == "out":
             sender_color = "#50fa7b"
@@ -152,8 +150,8 @@ class MessageRow(Static):
 
         markup = (
             f"[#1a5c7a]{ts}[/] "
-            f"[{sender_color} bold]{sender}[/]"
-            f"  {msg.body}"
+            f"[{sender_color} bold]{sender}:[/]"
+            f" {msg.body}"
         )
         super().__init__(markup)
 

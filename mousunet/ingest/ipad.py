@@ -80,7 +80,7 @@ def fetch_ipad_messages(since_apple_ts: int = 0, timeout: float = 15.0) -> list[
             "handle_id": handle_id,
             "text": text,
             "apple_date": apple_date,
-            "service": service.lower().replace("imessage", "imessage").replace("sms", "sms"),
+            "service": service.lower(),
             "guid": guid,
             "is_from_me": is_from_me == "1",
             "sent_at_iso": apple_ts_to_iso(apple_date),

@@ -6,7 +6,7 @@ from ..constants import RELAY_PATH
 from ..exceptions import RelayError
 
 
-def send_message(recipient: str, body: str, timeout: float = 30.0) -> str:
+def send_message(recipient: str, body: str, timeout: float = 60.0) -> str:
     """Call relay.sh and return its stdout.
 
     Args:
@@ -31,6 +31,8 @@ def send_message(recipient: str, body: str, timeout: float = 30.0) -> str:
         raise RelayError(f"relay timed out after {timeout}s") from e
     except FileNotFoundError as e:
         raise RelayError(f"relay script not found: {RELAY_PATH}") from e
+    except PermissionError as e:
+        raise RelayError(f"relay script not executable: {RELAY_PATH}") from e
 
     if result.returncode != 0:
         stderr = result.stderr.strip()

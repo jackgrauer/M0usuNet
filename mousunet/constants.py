@@ -6,17 +6,11 @@ from pathlib import Path
 # Database — override with MOUSUNET_DB env var
 DB_PATH = Path(os.environ.get("MOUSUNET_DB", str(Path.home() / "mousunet.db")))
 
-# Relay — override with MOUSUNET_RELAY env var
-# Pi: ~/relay.sh (local)
-# Mac: ~/bin/msg (routes through Pi)
+# Relay — ~/relay.sh on Pi (direct to iPad/Pixel)
 RELAY_PATH = Path(os.environ.get("MOUSUNET_RELAY", str(Path.home() / "relay.sh")))
 
 # Contacts
 CONTACTS_TSV = Path.home() / "contacts.tsv"
-
-# Polling
-POLL_INTERVAL = 5.0  # seconds (TUI refresh)
-INGEST_INTERVAL = 30  # seconds (message ingestion)
 
 # DedSec palette
 class Color:

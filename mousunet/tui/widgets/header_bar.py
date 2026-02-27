@@ -13,9 +13,20 @@ from textual.widgets import Static
 
 
 MESH_DEVICES = {
-    "PIXEL": "pixel",
-    "IPAD": "ipad",
+    "PIXEL": "192.168.0.22",
+    "IPAD": "192.168.0.11",
 }
+
+
+class TabButton(Static):
+    """Clickable tab button in the header."""
+
+    def on_click(self, event) -> None:
+        event.stop()
+        if self.id == "tab-messages":
+            self.app.action_show_messages()
+        elif self.id == "tab-editor":
+            self.app.action_reply_editor()
 
 
 class HeaderBar(Widget):
@@ -24,10 +35,13 @@ class HeaderBar(Widget):
     def __init__(self) -> None:
         super().__init__()
         self._device_status: dict[str, bool] = {name: False for name in MESH_DEVICES}
+        self._pinging = False
 
     def compose(self) -> ComposeResult:
         with Horizontal():
             yield Static("M0usuNet", id="app-title")
+            yield TabButton(" MESSAGES ", id="tab-messages", classes="tab-btn --active")
+            yield TabButton(" COMPOSE ", id="tab-editor", classes="tab-btn")
             yield Static("", id="mesh-status")
             yield Static("", id="clock")
 
@@ -47,21 +61,27 @@ class HeaderBar(Widget):
 
     def _check_devices_bg(self) -> None:
         """Run pings in a background thread so they don't block the UI."""
+        if self._pinging:
+            return
+        self._pinging = True
         threading.Thread(target=self._ping_devices, daemon=True).start()
 
     def _ping_devices(self) -> None:
-        for label, host in MESH_DEVICES.items():
-            try:
-                result = subprocess.run(
-                    ["ping", "-c", "1", "-W", "1", host],
-                    capture_output=True,
-                    timeout=3,
-                )
-                self._device_status[label] = result.returncode == 0
-            except Exception:
-                self._device_status[label] = False
-        # Schedule UI update back on the main thread
-        self.app.call_from_thread(self._render_status)
+        try:
+            for label, host in MESH_DEVICES.items():
+                try:
+                    result = subprocess.run(
+                        ["ping", "-c", "1", "-W", "1", host],
+                        capture_output=True,
+                        timeout=3,
+                    )
+                    self._device_status[label] = result.returncode == 0
+                except Exception:
+                    self._device_status[label] = False
+            # Schedule UI update back on the main thread
+            self.app.call_from_thread(self._render_status)
+        finally:
+            self._pinging = False
 
     def _render_status(self) -> None:
         parts = []
