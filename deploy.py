@@ -27,6 +27,7 @@ scripts = [
     "pixel-sms.sh",
     "yt.sh",
     "dashboard.sh",
+    "m0usunet",
 ]
 
 script_results = {}

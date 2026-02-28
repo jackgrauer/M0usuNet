@@ -9,7 +9,7 @@ PI_HOME="/home/jackpi5"
 IPAD="ipad"  # via Pi SSH
 IPAD_CONTACTS="/var/jb/usr/local/bin/contacts.tsv"
 
-PI_SCRIPTS=(relay.sh imcheck.sh ipad-watchdog.sh pixel-watchdog.sh pixel.sh pixel-wait.sh pixel-sms.sh yt.sh dashboard.sh)
+PI_SCRIPTS=(relay.sh imcheck.sh ipad-watchdog.sh pixel-watchdog.sh pixel.sh pixel-wait.sh pixel-sms.sh yt.sh dashboard.sh m0usunet)
 PI_UNITS=(ipad-watchdog.service pixel-watchdog.service watchdog-alert@.service)
 PI_SERVICES=(ipad-watchdog pixel-watchdog)
 
