@@ -1,0 +1,18 @@
+[Unit]
+Description=iPad Jailbreak Watchdog
+After=network.target
+OnFailure=watchdog-alert@%n.service
+StartLimitBurst=5
+StartLimitIntervalSec=300
+
+[Service]
+Type=notify
+User=jackpi5
+ExecStart=/home/jackpi5/ipad-watchdog.sh
+WatchdogSec=120
+NotifyAccess=all
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

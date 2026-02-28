@@ -1,0 +1,34 @@
+#!/bin/bash
+# sms - send SMS via Mac Messages app (relays through iPhone)
+# Usage: sms <number> <message>
+# Works for Android recipients (green bubble)
+
+if [ $# -lt 2 ]; then
+    echo "Usage: sms <number> <message>" >&2
+    exit 1
+fi
+
+recipient="$1"
+shift
+message="$*"
+
+# Normalize number to +1XXXXXXXXXX if needed
+if echo "$recipient" | grep -qE '^[0-9]{10}$'; then
+    recipient="+1$recipient"
+elif echo "$recipient" | grep -qE '^1[0-9]{10}$'; then
+    recipient="+$recipient"
+fi
+
+osascript -e "
+tell application \"Messages\"
+    set targetService to 1st service whose service type = SMS
+    set theBuddy to buddy \"$recipient\" of targetService
+    send \"$message\" to theBuddy
+end tell"
+
+if [ $? -eq 0 ]; then
+    echo "Sent SMS to $recipient: $message"
+else
+    echo "Failed to send SMS to $recipient" >&2
+    exit 1
+fi

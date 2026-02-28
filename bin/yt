@@ -1,0 +1,3 @@
+#!/bin/bash
+# yt - shortcut for m0usunet yt
+exec m0usunet yt "$@"

@@ -1,0 +1,278 @@
+#!/bin/bash
+# mesh-sync - Deploy scripts and configs to mesh network devices
+# Source of truth: ~/mesh/
+# Usage: mesh-sync <all|pi|ipad|contacts|status>
+
+MESH_DIR="$HOME/mesh"
+PI="pi5"
+PI_HOME="/home/jackpi5"
+IPAD="ipad"  # via Pi SSH
+IPAD_CONTACTS="/var/jb/usr/local/bin/contacts.tsv"
+
+PI_SCRIPTS=(relay.sh imcheck.sh ipad-watchdog.sh pixel-watchdog.sh pixel.sh pixel-wait.sh pixel-sms.sh yt.sh dashboard.sh)
+PI_UNITS=(ipad-watchdog.service pixel-watchdog.service watchdog-alert@.service)
+PI_SERVICES=(ipad-watchdog pixel-watchdog)
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+yellow(){ printf '\033[33m%s\033[0m\n' "$*"; }
+
+sync_pi() {
+    echo "=== Deploying to Pi ==="
+    local changed=0
+    local units_changed=0
+
+    # Sync scripts via rsync
+    for script in "${PI_SCRIPTS[@]}"; do
+        local src="$MESH_DIR/$script"
+        if [ ! -f "$src" ]; then
+            yellow "SKIP $script (not in ~/mesh/)"
+            continue
+        fi
+
+        local output
+        output=$(rsync -azc --itemize-changes "$src" "$PI:$PI_HOME/$script" 2>&1)
+        if echo "$output" | grep -q '^>f'; then
+            ssh "$PI" "chmod +x $PI_HOME/$script"
+            green "PUSH $script"
+            changed=1
+        else
+            green "OK   $script"
+        fi
+    done
+
+    # Sync systemd unit files
+    for unit in "${PI_UNITS[@]}"; do
+        local src="$MESH_DIR/$unit"
+        if [ ! -f "$src" ]; then
+            yellow "SKIP $unit (not in ~/mesh/)"
+            continue
+        fi
+
+        # rsync to tmp, then sudo cp to /etc/systemd/system/
+        scp -q "$src" "$PI:/tmp/$unit"
+        local diff
+        diff=$(ssh "$PI" "diff -q /tmp/$unit /etc/systemd/system/$unit 2>/dev/null")
+        if [ $? -ne 0 ]; then
+            ssh "$PI" "sudo cp /tmp/$unit /etc/systemd/system/$unit"
+            green "PUSH $unit"
+            units_changed=1
+        else
+            green "OK   $unit"
+        fi
+    done
+
+    # Push pixel-sms.sh to Pixel via ADB
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI" "adb devices 2>/dev/null | grep -q 'device$'" &>/dev/null; then
+        ssh "$PI" "adb push $PI_HOME/pixel-sms.sh /data/local/tmp/pixel-sms.sh && adb shell su -c 'chmod 755 /data/local/tmp/pixel-sms.sh'" &>/dev/null
+        if [ $? -eq 0 ]; then
+            green "PUSH pixel-sms.sh -> Pixel"
+        else
+            yellow "SKIP pixel-sms.sh -> Pixel (ADB push failed)"
+        fi
+    else
+        yellow "SKIP pixel-sms.sh -> Pixel (not connected)"
+    fi
+
+    if [ $units_changed -eq 1 ]; then
+        ssh "$PI" "sudo systemctl daemon-reload"
+        green "RELOAD systemd daemon"
+    fi
+
+    if [ $changed -eq 1 ] || [ $units_changed -eq 1 ]; then
+        echo "Restarting services..."
+        for svc in "${PI_SERVICES[@]}"; do
+            ssh "$PI" "sudo systemctl restart $svc"
+            green "RESTART $svc"
+        done
+    else
+        echo "No changes — services not restarted"
+    fi
+}
+
+sync_contacts() {
+    echo "=== Syncing contacts ==="
+    local src="$MESH_DIR/contacts.tsv"
+
+    if [ ! -f "$src" ]; then
+        red "ERROR: $src not found"
+        return 1
+    fi
+
+    # Mac → Pi via rsync
+    local output
+    output=$(rsync -azc --itemize-changes "$src" "$PI:$PI_HOME/contacts.tsv" 2>&1)
+    if echo "$output" | grep -q '^>f'; then
+        green "PUSH Pi contacts"
+    else
+        green "OK   Pi contacts"
+    fi
+
+    # Pi → iPad
+    local local_hash
+    local ipad_hash
+    local_hash=$(shasum -a 256 "$src" 2>/dev/null | cut -d' ' -f1)
+    ipad_hash=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI" \
+        "ssh -o ConnectTimeout=5 -o BatchMode=yes $IPAD 'sha256sum $IPAD_CONTACTS 2>/dev/null || shasum -a 256 $IPAD_CONTACTS 2>/dev/null' | cut -d' ' -f1" 2>/dev/null)
+
+    if [ "$local_hash" = "$ipad_hash" ]; then
+        green "OK   iPad contacts"
+    else
+        ssh "$PI" "scp -q $PI_HOME/contacts.tsv $IPAD:$IPAD_CONTACTS" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            green "PUSH iPad contacts"
+        else
+            yellow "SKIP iPad contacts (iPad unreachable)"
+        fi
+    fi
+}
+
+sync_ipad() {
+    echo "=== Checking iPad ==="
+
+    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI" \
+        "ssh -o ConnectTimeout=5 -o BatchMode=yes $IPAD 'echo ok'" &>/dev/null; then
+        red "iPad unreachable"
+        return 1
+    fi
+    green "iPad SSH: OK"
+
+    sync_contacts
+
+    # Check entitlements
+    local ent_exists
+    ent_exists=$(ssh "$PI" "ssh $IPAD 'test -f /tmp/ent.plist && echo yes || echo no'" 2>/dev/null)
+    if [ "$ent_exists" = "yes" ]; then
+        green "OK   /tmp/ent.plist exists"
+    else
+        yellow "FIXING /tmp/ent.plist (recreating from backup)"
+        ssh "$PI" "ssh $IPAD 'cp /var/jb/usr/local/bin/imessage.entitlements /tmp/ent.plist && ldid -S/tmp/ent.plist /var/jb/usr/local/bin/imessage'" 2>/dev/null
+        if [ $? -eq 0 ]; then
+            green "FIXED /tmp/ent.plist + re-signed imessage"
+        else
+            red "FAILED to fix entitlements"
+        fi
+    fi
+}
+
+show_status() {
+    echo "=== Mesh Sync Status ==="
+    echo ""
+    echo "Pi scripts:"
+    for script in "${PI_SCRIPTS[@]}"; do
+        local src="$MESH_DIR/$script"
+        if [ ! -f "$src" ]; then
+            yellow "  ?  $script (not in ~/mesh/)"
+            continue
+        fi
+        local output
+        output=$(rsync -azc --itemize-changes --dry-run "$src" "$PI:$PI_HOME/$script" 2>&1)
+        if echo "$output" | grep -q '^>f'; then
+            red "  != $script"
+        else
+            green "  =  $script"
+        fi
+    done
+
+    echo ""
+    echo "Pi units:"
+    for unit in "${PI_UNITS[@]}"; do
+        local src="$MESH_DIR/$unit"
+        if [ ! -f "$src" ]; then
+            yellow "  ?  $unit (not in ~/mesh/)"
+            continue
+        fi
+        scp -q "$src" "$PI:/tmp/$unit"
+        if ssh "$PI" "diff -q /tmp/$unit /etc/systemd/system/$unit" &>/dev/null; then
+            green "  =  $unit"
+        else
+            red "  != $unit"
+        fi
+    done
+
+    echo ""
+    echo "Contacts:"
+    local output
+    output=$(rsync -azc --itemize-changes --dry-run "$MESH_DIR/contacts.tsv" "$PI:$PI_HOME/contacts.tsv" 2>&1)
+    if echo "$output" | grep -q '^>f'; then
+        red "  != Pi"
+    else
+        green "  =  Pi"
+    fi
+
+    local local_hash ipad_hash
+    local_hash=$(shasum -a 256 "$MESH_DIR/contacts.tsv" 2>/dev/null | cut -d' ' -f1)
+    ipad_hash=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI" \
+        "ssh -o ConnectTimeout=5 -o BatchMode=yes $IPAD 'sha256sum $IPAD_CONTACTS 2>/dev/null || shasum -a 256 $IPAD_CONTACTS 2>/dev/null' | cut -d' ' -f1" 2>/dev/null)
+    if [ -z "$ipad_hash" ]; then
+        yellow "  ?  iPad (unreachable)"
+    elif [ "$local_hash" = "$ipad_hash" ]; then
+        green "  =  iPad"
+    else
+        red "  != iPad"
+    fi
+
+    echo ""
+    echo "Services:"
+    for svc in "${PI_SERVICES[@]}"; do
+        local state
+        state=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI" \
+            "systemctl is-active $svc 2>/dev/null" 2>/dev/null)
+        if [ "$state" = "active" ]; then
+            green "  UP $svc"
+        else
+            red "  DOWN $svc ($state)"
+        fi
+    done
+
+    echo ""
+    echo "iPad entitlements:"
+    local ent
+    ent=$(ssh -o ConnectTimeout=5 -o BatchMode=yes "$PI" \
+        "ssh -o ConnectTimeout=5 -o BatchMode=yes $IPAD 'test -f /tmp/ent.plist && echo yes || echo no'" 2>/dev/null)
+    if [ "$ent" = "yes" ]; then
+        green "  OK /tmp/ent.plist"
+    elif [ -z "$ent" ]; then
+        yellow "  ?  iPad unreachable"
+    else
+        red "  MISSING /tmp/ent.plist"
+    fi
+
+    echo ""
+    echo "Logs:"
+    ssh "$PI" 'journalctl -u ipad-watchdog -u pixel-watchdog --no-pager -n1 -q 2>/dev/null' | while read -r line; do
+        green "  $line"
+    done
+}
+
+case "${1:-}" in
+    all)
+        sync_pi
+        echo ""
+        sync_contacts
+        echo ""
+        sync_ipad
+        ;;
+    pi)
+        sync_pi
+        ;;
+    ipad)
+        sync_ipad
+        ;;
+    contacts)
+        sync_contacts
+        ;;
+    status)
+        show_status
+        ;;
+    *)
+        echo "Usage: mesh-sync <all|pi|ipad|contacts|status>"
+        echo ""
+        echo "  all       Deploy everything"
+        echo "  pi        Push scripts + restart services"
+        echo "  ipad      Push contacts + verify entitlements"
+        echo "  contacts  Sync contacts.tsv to Pi and iPad"
+        echo "  status    Show what's out of sync"
+        exit 1
+        ;;
+esac

@@ -1,0 +1,11 @@
+#!/bin/bash
+# msg - send message through Pi relay (source of truth)
+# Usage: msg <recipient> <message>
+# All messages logged on Pi at ~/messages.log
+
+if [ $# -lt 2 ]; then
+    echo "Usage: msg <name|number> <message>" >&2
+    exit 1
+fi
+
+ssh pi5 "/home/jackpi5/relay.sh $1 ${*:2}"

@@ -1,0 +1,7 @@
+[Unit]
+Description=Watchdog failure alert for %i
+
+[Service]
+Type=oneshot
+User=jackpi5
+ExecStart=/bin/bash -c 'curl -s -d "CRITICAL: %i has crashed and exhausted restart attempts" ntfy.sh/jack-mesh-alerts'
