@@ -318,6 +318,9 @@ def main(stdscr):
     stdscr.timeout(200)
     stdscr.keypad(True)
 
+    # Reduce flicker: use erase() not clear(), and
+    # noutrefresh()+doupdate() for atomic screen update
+
     store = Store()
     tab = 0
     last_home_kick = 0
@@ -328,15 +331,16 @@ def main(stdscr):
     tv_input = ""
     tv_status = ""
 
+    dirty = True  # Need initial draw
+    prev_snapshot = None  # Track data changes between frames
+
     store.refresh_home()
     store.refresh_messages()
 
     while True:
-        h, w = stdscr.getmaxyx()
-        stdscr.clear()
-
         now = time.time()
 
+        # Kick background refreshes on schedule
         if tab == 0 and now - last_home_kick > 10:
             store.refresh_home()
             last_home_kick = now
@@ -344,20 +348,38 @@ def main(stdscr):
             store.refresh_mpv()
             last_mpv_kick = now
 
-        draw_tabs(stdscr, tab, w)
-
+        # Check if background data changed (mark dirty if so)
         if tab == 0:
-            draw_home(stdscr, store.get_home(), w)
+            snap = repr(store.get_home())
         elif tab == 1:
-            draw_messaging(stdscr, msg_input, msg_status, store.get_messages(), w)
+            snap = repr(store.get_messages()) + msg_status
         elif tab == 2:
-            draw_tv(stdscr, tv_input, tv_status, store.get_mpv(), w)
+            snap = repr(store.get_mpv()) + tv_status
+        if snap != prev_snapshot:
+            prev_snapshot = snap
+            dirty = True
 
-        stdscr.attron(curses.A_DIM)
-        safe_addstr(stdscr, h - 1, 1, " Tab=next tab  q=quit (from HOME) ")
-        stdscr.attroff(curses.A_DIM)
+        # Only redraw when something changed
+        if dirty:
+            h, w = stdscr.getmaxyx()
+            stdscr.erase()
 
-        stdscr.refresh()
+            draw_tabs(stdscr, tab, w)
+
+            if tab == 0:
+                draw_home(stdscr, store.get_home(), w)
+            elif tab == 1:
+                draw_messaging(stdscr, msg_input, msg_status, store.get_messages(), w)
+            elif tab == 2:
+                draw_tv(stdscr, tv_input, tv_status, store.get_mpv(), w)
+
+            stdscr.attron(curses.A_DIM)
+            safe_addstr(stdscr, h - 1, 1, " Tab=next tab  q=quit (from HOME) ")
+            stdscr.attroff(curses.A_DIM)
+
+            stdscr.noutrefresh()
+            curses.doupdate()
+            dirty = False
 
         try:
             ch = stdscr.getch()
@@ -365,6 +387,11 @@ def main(stdscr):
             continue
 
         if ch == -1:
+            continue
+
+        dirty = True  # Any keypress triggers redraw
+
+        if ch == curses.KEY_RESIZE:
             continue
 
         if ch == 9:  # Tab = next tab
@@ -393,7 +420,6 @@ def main(stdscr):
             elif ch == 10:
                 if msg_input["to"] and msg_input["msg"]:
                     msg_status = "Sending..."
-                    stdscr.refresh()
                     to_addr = msg_input["to"]
                     msg_text = msg_input["msg"]
                     def send():
