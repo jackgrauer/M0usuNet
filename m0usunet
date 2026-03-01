@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """M0usuNet - Mesh network hub TUI (runs on Pi)"""
 import datetime
+import json
 import os
 import re
 import subprocess
@@ -9,6 +10,7 @@ import threading
 import time
 
 PI_HOME = "/home/jackpi5"
+SCHEDULE_FILE = f"{PI_HOME}/scheduled.json"
 
 def run(cmd, timeout=10):
     try:
@@ -90,6 +92,89 @@ def parse_pixel_sms(raw):
             messages.append(msg)
     return messages
 
+def parse_schedule_time(s):
+    s = s.strip()
+    m = re.match(r'^\+(\d+)([hmd])$', s)
+    if m:
+        val, unit = int(m.group(1)), m.group(2)
+        delta = {'h': datetime.timedelta(hours=val),
+                 'm': datetime.timedelta(minutes=val),
+                 'd': datetime.timedelta(days=val)}[unit]
+        return datetime.datetime.now() + delta
+    for fmt in ["%Y-%m-%d %H:%M", "%m/%d %H:%M", "%m/%d/%Y %H:%M"]:
+        try:
+            dt = datetime.datetime.strptime(s, fmt)
+            if dt.year == 1900:
+                dt = dt.replace(year=datetime.datetime.now().year)
+            return dt
+        except:
+            continue
+    return None
+
+def compute_analytics(messages):
+    if not messages:
+        return {"empty": True}
+    sent = [m for m in messages if m.get("is_from_me")]
+    recv = [m for m in messages if not m.get("is_from_me")]
+    total = len(messages)
+    stats = {
+        "empty": False,
+        "total": total,
+        "sent": len(sent),
+        "recv": len(recv),
+        "pct_sent": round(100 * len(sent) / total) if total else 0,
+        "first_date": messages[0]["date"],
+        "last_date": messages[-1]["date"],
+    }
+    # Who texts first (after 4h+ gap)
+    initiations = {"you": 0, "them": 0}
+    gap_threshold = datetime.timedelta(hours=4)
+    for i, msg in enumerate(messages):
+        if i == 0 or (msg["date"] - messages[i-1]["date"]) > gap_threshold:
+            if msg.get("is_from_me"):
+                initiations["you"] += 1
+            else:
+                initiations["them"] += 1
+    stats["initiations"] = initiations
+    total_init = initiations["you"] + initiations["them"]
+    stats["you_initiate_pct"] = round(100 * initiations["you"] / total_init) if total_init else 0
+
+    # Response times
+    you_times, them_times = [], []
+    for i in range(1, len(messages)):
+        prev, curr = messages[i-1], messages[i]
+        delta = (curr["date"] - prev["date"]).total_seconds()
+        if delta > 14400:  # skip gaps > 4h (new conversation)
+            continue
+        if not prev.get("is_from_me") and curr.get("is_from_me"):
+            you_times.append(delta)
+        elif prev.get("is_from_me") and not curr.get("is_from_me"):
+            them_times.append(delta)
+    stats["your_avg_reply"] = sum(you_times) / len(you_times) if you_times else None
+    stats["their_avg_reply"] = sum(them_times) / len(them_times) if them_times else None
+
+    # Activity by day of week and hour
+    day_counts = {}
+    hour_counts = {}
+    for msg in messages:
+        day = msg["date"].strftime("%A")
+        hour = msg["date"].hour
+        day_counts[day] = day_counts.get(day, 0) + 1
+        hour_counts[hour] = hour_counts.get(hour, 0) + 1
+    stats["busiest_day"] = max(day_counts, key=day_counts.get) if day_counts else "?"
+    stats["busiest_hour"] = max(hour_counts, key=hour_counts.get) if hour_counts else 0
+
+    return stats
+
+def format_duration(secs):
+    if secs is None:
+        return "n/a"
+    if secs < 60:
+        return f"{int(secs)}s"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    return f"{secs / 3600:.1f}h"
+
 # ── Background data store ──
 
 class Store:
@@ -105,8 +190,13 @@ class Store:
         self.contacts = {}
         self.conversations = []
         self.chat_messages = []
+        self.search_results = []
+        self.analytics_data = {}
+        self.scheduled = []
         self._conv_thread = None
         self._chat_thread = None
+        self._search_thread = None
+        self._analytics_thread = None
         self._contacts_loaded = False
 
     def ensure_contacts(self):
@@ -144,6 +234,18 @@ class Store:
             return
         self._chat_thread = threading.Thread(target=self._do_chat, args=(phone,), daemon=True)
         self._chat_thread.start()
+
+    def search(self, query):
+        if self._search_thread and self._search_thread.is_alive():
+            return
+        self._search_thread = threading.Thread(target=self._do_search, args=(query,), daemon=True)
+        self._search_thread.start()
+
+    def refresh_analytics(self, phone):
+        if self._analytics_thread and self._analytics_thread.is_alive():
+            return
+        self._analytics_thread = threading.Thread(target=self._do_analytics, args=(phone,), daemon=True)
+        self._analytics_thread.start()
 
     def _do_home(self):
         results = {}
@@ -246,6 +348,7 @@ class Store:
                         "service": svc_tag,
                         "last_msg": preview,
                         "last_date": dt,
+                        "is_from_me": is_from_me,
                     }
 
         pixel_raw = run(
@@ -279,13 +382,15 @@ class Store:
                         "service": "sms",
                         "last_msg": preview,
                         "last_date": dt,
+                        "is_from_me": is_from_me,
                     }
 
         sorted_convos = sorted(convos.values(), key=lambda c: c["last_date"], reverse=True)
         with self.lock:
             self.conversations = sorted_convos
 
-    def _do_chat(self, phone):
+    def _fetch_messages_for(self, phone):
+        """Fetch all messages for a phone number (shared by chat + analytics)."""
         self.ensure_contacts()
         digits = re.sub(r'\D', '', phone)
         match_digits = digits[-10:] if len(digits) >= 10 else digits
@@ -339,8 +444,180 @@ class Store:
                 })
 
         messages.sort(key=lambda m: m["date"])
+        return messages
+
+    def _do_chat(self, phone):
+        messages = self._fetch_messages_for(phone)
         with self.lock:
             self.chat_messages = messages
+
+    def _do_search(self, query):
+        self.ensure_contacts()
+        results = []
+        safe_q = query.replace("'", "''")
+
+        ipad_raw = run(
+            'ssh -o ConnectTimeout=5 -o BatchMode=yes ipad '
+            '"sqlite3 /var/mobile/Library/SMS/sms.db '
+            '\\"SELECT h.id, m.text, m.is_from_me, m.date, m.service '
+            'FROM message m JOIN handle h ON m.handle_id = h.ROWID '
+            f"WHERE m.text LIKE \'%{safe_q}%\' "
+            'ORDER BY m.date DESC LIMIT 50;\\"" 2>/dev/null',
+            timeout=15
+        )
+        if ipad_raw:
+            for line in ipad_raw.split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 5:
+                    phone = parts[0].strip()
+                    text = parts[1].strip() if parts[1] else ""
+                    is_from_me = parts[2].strip() == '1'
+                    try:
+                        date_val = int(parts[3].strip())
+                    except:
+                        continue
+                    service = parts[4].strip().lower()
+                    dt = apple_date(date_val)
+                    svc_tag = "imsg" if "imessage" in service else "sms"
+                    results.append({
+                        "phone": phone,
+                        "name": self.resolve_name(phone),
+                        "text": text, "is_from_me": is_from_me,
+                        "date": dt, "service": svc_tag,
+                    })
+
+        safe_q_adb = query.replace('"', '\\"')
+        pixel_raw = run(
+            f"adb shell 'content query --uri content://sms "
+            f"--projection address:body:date:type "
+            f'--where "body LIKE \\"%{safe_q_adb}%\\"" '
+            f'--sort "date DESC"\' 2>/dev/null',
+            timeout=15
+        )
+        if pixel_raw:
+            for msg in parse_pixel_sms(pixel_raw):
+                addr = msg.get('address', '')
+                body = msg.get('body', '')
+                try:
+                    dt = pixel_date(int(msg.get('date', '0')))
+                except:
+                    continue
+                is_from_me = msg.get('type', '') == '2'
+                results.append({
+                    "phone": addr,
+                    "name": self.resolve_name(addr),
+                    "text": body, "is_from_me": is_from_me,
+                    "date": dt, "service": "sms",
+                })
+
+        results.sort(key=lambda r: r["date"], reverse=True)
+        with self.lock:
+            self.search_results = results
+
+    def _do_analytics(self, phone):
+        messages = self._fetch_messages_for(phone)
+        stats = compute_analytics(messages)
+        with self.lock:
+            self.analytics_data = stats
+
+    # ── Scheduled messages ──
+
+    def load_schedule(self):
+        try:
+            with open(SCHEDULE_FILE, 'r') as f:
+                self.scheduled = json.load(f)
+        except:
+            self.scheduled = []
+
+    def save_schedule(self):
+        try:
+            with open(SCHEDULE_FILE, 'w') as f:
+                json.dump(self.scheduled, f, indent=2, default=str)
+        except:
+            pass
+
+    def add_scheduled(self, to, msg, send_at):
+        entry = {
+            "id": int(time.time() * 1000),
+            "to": to,
+            "msg": msg,
+            "send_at": send_at.isoformat(),
+            "status": "pending",
+        }
+        self.scheduled.append(entry)
+        self.save_schedule()
+        return entry
+
+    def remove_scheduled(self, entry_id):
+        self.scheduled = [s for s in self.scheduled if s.get("id") != entry_id]
+        self.save_schedule()
+
+    def check_scheduled(self):
+        """Fire any due scheduled messages. Called from cron or background thread."""
+        self.load_schedule()
+        now = datetime.datetime.now()
+        changed = False
+        for entry in self.scheduled:
+            if entry.get("status") != "pending":
+                continue
+            try:
+                send_at = datetime.datetime.fromisoformat(entry["send_at"])
+            except:
+                continue
+            if now >= send_at:
+                to = entry["to"].replace("'", "'\\''")
+                msg = entry["msg"].replace("'", "'\\''")
+                run(f"{PI_HOME}/relay.sh '{to}' '{msg}'", timeout=15)
+                entry["status"] = "sent"
+                entry["sent_at"] = now.isoformat()
+                changed = True
+        if changed:
+            self.save_schedule()
+
+    # ── Wingman ──
+
+    def wingman(self, messages, callback):
+        def _do():
+            try:
+                import anthropic
+            except ImportError:
+                callback(None, "pip install anthropic on Pi to enable wingman")
+                return
+
+            api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+            if not api_key or api_key.startswith("sk-ant-your"):
+                kf = os.path.expanduser("~/.anthropic_api_key")
+                if os.path.exists(kf):
+                    with open(kf) as f:
+                        api_key = f.read().strip()
+            if not api_key or api_key.startswith("sk-ant-your"):
+                callback(None, "Set ANTHROPIC_API_KEY or ~/.anthropic_api_key")
+                return
+
+            history = "\n".join(
+                f"{'Jack' if m.get('is_from_me') else 'Them'}: {m.get('text', '')}"
+                for m in messages[-20:]
+                if m.get('text')
+            )
+            try:
+                client = anthropic.Anthropic(api_key=api_key)
+                resp = client.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=200,
+                    system=(
+                        "You are Jack's messaging wingman. Given a conversation, "
+                        "suggest a short natural reply matching Jack's texting style. "
+                        "Keep it brief - this is texting. Just output the reply, "
+                        "nothing else - no quotes, no explanation."
+                    ),
+                    messages=[{"role": "user", "content": f"Conversation:\n{history}\n\nSuggest Jack's next reply:"}],
+                )
+                callback(resp.content[0].text, None)
+            except Exception as e:
+                callback(None, str(e)[:60])
+        threading.Thread(target=_do, daemon=True).start()
+
+    # ── Getters ──
 
     def get_home(self):
         with self.lock:
@@ -362,10 +639,22 @@ class Store:
         with self.lock:
             return list(self.chat_messages)
 
+    def get_search_results(self):
+        with self.lock:
+            return list(self.search_results)
+
+    def get_analytics(self):
+        with self.lock:
+            return dict(self.analytics_data)
+
 # ── Subcommand passthrough ──
 
 def cmd_yt(args):
     os.execvp(f"{PI_HOME}/yt.sh", [f"{PI_HOME}/yt.sh"] + args)
+
+def cmd_schedule_check():
+    store = Store()
+    store.check_scheduled()
 
 # ── Textual TUI ──
 
@@ -390,8 +679,19 @@ class ConversationItem(ListItem):
         dt = self.convo.get("last_date")
         time_str = relative_time(dt) if dt else ""
         preview = escape(self.convo.get("last_msg", "")[:50])
+
+        # Ghost tracker
+        ghost = ""
+        if dt:
+            hours = (datetime.datetime.now() - dt).total_seconds() / 3600
+            if hours >= 48:
+                if self.convo.get("is_from_me"):
+                    ghost = " [red]no reply[/red]"
+                else:
+                    ghost = " [yellow]unanswered[/yellow]"
+
         yield Static(
-            f"[bold]{name}[/bold]  \\[{svc}] [dim]{time_str}[/dim]\n"
+            f"[bold]{name}[/bold]  \\[{svc}] [dim]{time_str}[/dim]{ghost}\n"
             f"  [dim]{preview}[/dim]"
         )
 
@@ -407,12 +707,19 @@ class M0usuNetApp(App):
     #convo-list { height: 1fr; }
     #chat-container { height: 1fr; display: none; }
     #compose-container { height: auto; display: none; padding: 1 2; }
+    #search-container { height: 1fr; display: none; }
+    #analytics-container { height: 1fr; display: none; padding: 1 2; }
+    #schedule-container { height: 1fr; display: none; padding: 1 2; }
 
     #chat-header { height: 1; padding: 0 1; background: $primary-background; }
     #chat-log { height: 1fr; }
     #chat-input { dock: bottom; }
+    #wingman-status { height: 1; dock: bottom; display: none; }
 
     ConversationItem { height: 3; }
+
+    #search-input { dock: top; }
+    #search-results { height: 1fr; }
 
     #tv-scroll { height: 1fr; padding: 1 2; }
     #mpv-status { height: 4; border: solid $primary; padding: 0 1; margin: 1 0; }
@@ -434,6 +741,11 @@ class M0usuNetApp(App):
         self._last_convos_snap = None
         self._last_chat_snap = None
         self._last_mpv_snap = None
+        self._last_search_snap = None
+        self._last_analytics_snap = None
+        self._analytics_phone = None
+        self._analytics_name = None
+        self.store.load_schedule()
 
     def compose(self):
         yield Header()
@@ -446,12 +758,25 @@ class M0usuNetApp(App):
                 with Vertical(id="chat-container"):
                     yield Static("", id="chat-header")
                     yield RichLog(id="chat-log", markup=True)
-                    yield Input(placeholder="Type a message...", id="chat-input")
+                    yield Static("", id="wingman-status")
+                    yield Input(placeholder="Type a message... (Ctrl+G=wingman)", id="chat-input")
                 with Vertical(id="compose-container"):
-                    yield Static("[bold]NEW MESSAGE[/bold]", id="compose-title")
+                    yield Static("[bold]NEW MESSAGE[/bold]")
                     yield Input(placeholder="To (name or number)", id="compose-to")
                     yield Input(placeholder="Message", id="compose-msg")
                     yield Static("", id="compose-status")
+                with Vertical(id="search-container"):
+                    yield Input(placeholder="Search all messages...", id="search-input")
+                    yield RichLog(id="search-results", markup=True)
+                with VerticalScroll(id="analytics-container"):
+                    yield Static("", id="analytics-content")
+                with VerticalScroll(id="schedule-container"):
+                    yield Static("", id="schedule-content")
+                    yield Static("\n[bold]SCHEDULE NEW[/bold]")
+                    yield Input(placeholder="To (name or number)", id="schedule-to")
+                    yield Input(placeholder="Message", id="schedule-msg")
+                    yield Input(placeholder="When (+2h, +30m, +1d, 2026-03-15 08:00)", id="schedule-when")
+                    yield Static("", id="schedule-status")
             with TabPane("TV", id="tv-tab"):
                 with VerticalScroll(id="tv-scroll"):
                     yield Input(placeholder="Paste URL to play", id="tv-input")
@@ -472,6 +797,7 @@ class M0usuNetApp(App):
         self.store.refresh_home()
         self.store.refresh_conversations()
         self.set_interval(1.5, self._tick)
+        self.set_interval(30, self._schedule_tick)
 
     def _active_pane(self):
         try:
@@ -488,8 +814,27 @@ class M0usuNetApp(App):
                 self._update_conversations()
             elif self.msg_view == "chat":
                 self._update_chat()
+            elif self.msg_view == "search":
+                self._update_search()
+            elif self.msg_view == "analytics":
+                self._update_analytics()
         elif pane == "tv-tab":
             self._update_mpv()
+
+    def _schedule_tick(self):
+        self.store.check_scheduled()
+
+    _MSG_VIEWS = [
+        "convo-list", "chat-container", "compose-container",
+        "search-container", "analytics-container", "schedule-container",
+    ]
+
+    def _show_msg_view(self, view_id):
+        for v in self._MSG_VIEWS:
+            try:
+                self.query_one(f"#{v}").display = (v == view_id)
+            except:
+                pass
 
     # ── Home ──
 
@@ -557,6 +902,12 @@ class M0usuNetApp(App):
         if uptime:
             lines.append(f"\n[dim]Pi {escape(uptime)}[/dim]")
 
+        # Show scheduled message count
+        pending = [s for s in self.store.scheduled if s.get("status") == "pending"]
+        if pending:
+            lines.append(f"\n[bold]SCHEDULED[/bold]")
+            lines.append(f"  {len(pending)} message{'s' if len(pending) != 1 else ''} pending")
+
         self.query_one("#home-content", Static).update("\n".join(lines))
 
     # ── Conversations ──
@@ -593,12 +944,12 @@ class M0usuNetApp(App):
         self.msg_view = "chat"
         self._last_chat_snap = None
 
-        self.query_one("#convo-list").display = False
-        self.query_one("#compose-container").display = False
-        self.query_one("#chat-container").display = True
+        self._show_msg_view("chat-container")
         self.query_one("#chat-header", Static).update(
-            f"[bold cyan]{escape(self.chat_name)}[/bold cyan] \\[{self.chat_svc}]"
+            f"[bold cyan]{escape(self.chat_name)}[/bold cyan] \\[{self.chat_svc}]  "
+            f"[dim]Esc=back  Ctrl+G=wingman  a=analytics[/dim]"
         )
+        self.query_one("#wingman-status").display = False
 
         chat_log = self.query_one("#chat-log", RichLog)
         chat_log.clear()
@@ -626,24 +977,172 @@ class M0usuNetApp(App):
                 chat_log.write(f"[bold]them:[/bold] {escape(text)}")
         chat_log.scroll_end(animate=False)
 
-    def _close_chat(self):
+    def _back_to_list(self):
         self.msg_view = "list"
-        self._last_convos_snap = None  # force refresh
-        self.query_one("#chat-container").display = False
-        self.query_one("#compose-container").display = False
-        self.query_one("#convo-list").display = True
+        self._last_convos_snap = None
+        self._show_msg_view("convo-list")
         self.store.refresh_conversations()
         self.query_one("#convo-list", ListView).focus()
 
     def _open_compose(self):
         self.msg_view = "compose"
-        self.query_one("#convo-list").display = False
-        self.query_one("#chat-container").display = False
-        self.query_one("#compose-container").display = True
+        self._show_msg_view("compose-container")
         self.query_one("#compose-to", Input).value = ""
         self.query_one("#compose-msg", Input).value = ""
         self.query_one("#compose-status", Static).update("")
         self.query_one("#compose-to", Input).focus()
+
+    # ── Search ──
+
+    def _open_search(self):
+        self.msg_view = "search"
+        self._last_search_snap = None
+        self._show_msg_view("search-container")
+        self.query_one("#search-input", Input).value = ""
+        sr = self.query_one("#search-results", RichLog)
+        sr.clear()
+        sr.write("[dim]Type a search term and press Enter[/dim]")
+        self.query_one("#search-input", Input).focus()
+
+    def _update_search(self):
+        results = self.store.get_search_results()
+        snap = repr(results)
+        if snap == self._last_search_snap:
+            return
+        self._last_search_snap = snap
+
+        sr = self.query_one("#search-results", RichLog)
+        sr.clear()
+        if not results:
+            sr.write("[dim]No results[/dim]")
+        else:
+            sr.write(f"[bold]{len(results)} results[/bold]\n")
+            for r in results:
+                name = escape(r.get("name", r.get("phone", "?")))
+                text = escape(r.get("text", "")[:80])
+                dt = r.get("date")
+                time_str = relative_time(dt) if dt else ""
+                who = "[cyan]you[/cyan]" if r.get("is_from_me") else f"[bold]{name}[/bold]"
+                sr.write(f"{who}  [dim]{time_str}  \\[{r.get('service', '?')}][/dim]")
+                sr.write(f"  {text}\n")
+
+    # ── Analytics ──
+
+    def _open_analytics(self, phone, name):
+        self.msg_view = "analytics"
+        self._last_analytics_snap = None
+        self._analytics_phone = phone
+        self._analytics_name = name
+        self._show_msg_view("analytics-container")
+        self.query_one("#analytics-content", Static).update(
+            f"[bold cyan]ANALYTICS: {escape(name)}[/bold cyan]\n\n[dim]Loading...[/dim]"
+        )
+        self.store.refresh_analytics(phone)
+
+    def _update_analytics(self):
+        stats = self.store.get_analytics()
+        snap = repr(stats)
+        if snap == self._last_analytics_snap:
+            return
+        self._last_analytics_snap = snap
+
+        if stats.get("empty"):
+            self.query_one("#analytics-content", Static).update(
+                f"[bold cyan]ANALYTICS: {escape(self._analytics_name or '?')}[/bold cyan]\n\n"
+                "[dim]No messages to analyze[/dim]"
+            )
+            return
+
+        name = escape(self._analytics_name or "?")
+        lines = [f"[bold cyan]ANALYTICS: {name}[/bold cyan]\n"]
+
+        lines.append("[bold]MESSAGES[/bold]")
+        lines.append(f"  Total: {stats['total']}")
+        lines.append(f"  You sent: {stats['sent']} ({stats['pct_sent']}%)")
+        lines.append(f"  They sent: {stats['recv']} ({100 - stats['pct_sent']}%)")
+
+        lines.append(f"\n[bold]TIMING[/bold]")
+        fd = stats.get("first_date")
+        ld = stats.get("last_date")
+        if fd:
+            lines.append(f"  First message: {fd.strftime('%b %d, %Y')}")
+        if ld:
+            lines.append(f"  Last message: {relative_time(ld)}")
+        lines.append(f"  Your avg reply: {format_duration(stats.get('your_avg_reply'))}")
+        lines.append(f"  Their avg reply: {format_duration(stats.get('their_avg_reply'))}")
+
+        lines.append(f"\n[bold]WHO TEXTS FIRST[/bold]")
+        init = stats.get("initiations", {})
+        lines.append(f"  You: {init.get('you', 0)} times ({stats.get('you_initiate_pct', 0)}%)")
+        lines.append(f"  Them: {init.get('them', 0)} times ({100 - stats.get('you_initiate_pct', 0)}%)")
+
+        lines.append(f"\n[bold]ACTIVITY[/bold]")
+        lines.append(f"  Busiest day: {stats.get('busiest_day', '?')}")
+        bh = stats.get("busiest_hour", 0)
+        lines.append(f"  Busiest hour: {bh}:00-{bh}:59")
+
+        lines.append("\n[dim]Esc=back[/dim]")
+
+        self.query_one("#analytics-content", Static).update("\n".join(lines))
+
+    # ── Schedule ──
+
+    def _open_schedule(self):
+        self.msg_view = "schedule"
+        self._show_msg_view("schedule-container")
+        self._render_schedule()
+        self.query_one("#schedule-to", Input).value = ""
+        self.query_one("#schedule-msg", Input).value = ""
+        self.query_one("#schedule-when", Input).value = ""
+        self.query_one("#schedule-status", Static).update("")
+        self.query_one("#schedule-to", Input).focus()
+
+    def _render_schedule(self):
+        lines = ["[bold cyan]SCHEDULED MESSAGES[/bold cyan]\n"]
+        pending = [s for s in self.store.scheduled if s.get("status") == "pending"]
+        sent = [s for s in self.store.scheduled if s.get("status") == "sent"][-5:]
+
+        if pending:
+            lines.append(f"[bold]PENDING ({len(pending)})[/bold]")
+            for s in pending:
+                to = escape(str(s.get("to", "?")))
+                msg = escape(str(s.get("msg", ""))[:40])
+                when = s.get("send_at", "?")
+                lines.append(f"  [green]>[/green] {to}: {msg}")
+                lines.append(f"    [dim]at {when}  (id:{s.get('id',0)})[/dim]")
+        else:
+            lines.append("[dim]No pending messages[/dim]")
+
+        if sent:
+            lines.append(f"\n[bold]RECENTLY SENT[/bold]")
+            for s in sent:
+                to = escape(str(s.get("to", "?")))
+                msg = escape(str(s.get("msg", ""))[:40])
+                lines.append(f"  [dim]{to}: {msg} (sent {s.get('sent_at', '?')})[/dim]")
+
+        lines.append("\n[dim]d=delete pending by id  Esc=back[/dim]")
+        self.query_one("#schedule-content", Static).update("\n".join(lines))
+
+    # ── Wingman ──
+
+    def _trigger_wingman(self):
+        msgs = self.store.get_chat_messages()
+        if not msgs:
+            return
+        ws = self.query_one("#wingman-status", Static)
+        ws.display = True
+        ws.update("[dim]Wingman thinking...[/dim]")
+
+        def on_result(suggestion, error):
+            def update():
+                if error:
+                    ws.update(f"[red]{escape(error)}[/red]")
+                elif suggestion:
+                    self.query_one("#chat-input", Input).value = suggestion
+                    ws.update("[green]Suggestion ready - edit and Enter to send[/green]")
+            self.call_from_thread(update)
+
+        self.store.wingman(msgs, on_result)
 
     # ── TV ──
 
@@ -688,7 +1187,7 @@ class M0usuNetApp(App):
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
         pane_id = event.pane.id
         if pane_id == "home-tab":
-            self._home_kick = 0  # force immediate refresh
+            self._home_kick = 0
         elif pane_id == "msg-tab":
             self._conv_kick = 0
         elif pane_id == "tv-tab":
@@ -704,6 +1203,7 @@ class M0usuNetApp(App):
             if not text:
                 return
             event.input.value = ""
+            self.query_one("#wingman-status").display = False
             phone = self.chat_phone
             chat_log = self.query_one("#chat-log", RichLog)
             chat_log.write(f"[cyan]you:[/cyan]  {escape(text)}")
@@ -713,15 +1213,24 @@ class M0usuNetApp(App):
                 run(f"{PI_HOME}/relay.sh '{p}' '{escaped}'", timeout=15)
                 time.sleep(1)
                 self.store.refresh_chat(p)
-                self._last_chat_snap = None  # force UI update
+                self._last_chat_snap = None
             threading.Thread(target=send, daemon=True).start()
+
+        elif event.input.id == "search-input":
+            query = event.value.strip()
+            if query:
+                sr = self.query_one("#search-results", RichLog)
+                sr.clear()
+                sr.write("[dim]Searching...[/dim]")
+                self._last_search_snap = None
+                self.store.search(query)
 
         elif event.input.id == "tv-input":
             url = event.value.strip()
             if not url:
                 return
             event.input.value = ""
-            self.set_focus(None)  # blur so TV controls work
+            self.set_focus(None)
             def play(u=url):
                 run(f"{PI_HOME}/yt.sh '{u}'", timeout=20)
                 time.sleep(2)
@@ -749,14 +1258,40 @@ class M0usuNetApp(App):
                 self._last_convos_snap = None
             threading.Thread(target=send, daemon=True).start()
 
+        elif event.input.id == "schedule-to":
+            self.query_one("#schedule-msg", Input).focus()
+
+        elif event.input.id == "schedule-msg":
+            self.query_one("#schedule-when", Input).focus()
+
+        elif event.input.id == "schedule-when":
+            to_val = self.query_one("#schedule-to", Input).value.strip()
+            msg_val = self.query_one("#schedule-msg", Input).value.strip()
+            when_val = event.value.strip()
+            status = self.query_one("#schedule-status", Static)
+            if not (to_val and msg_val and when_val):
+                status.update("[red]Fill in all fields[/red]")
+                return
+            dt = parse_schedule_time(when_val)
+            if not dt:
+                status.update("[red]Bad time format. Use +2h, +30m, +1d, or YYYY-MM-DD HH:MM[/red]")
+                return
+            self.store.add_scheduled(to_val, msg_val, dt)
+            self.query_one("#schedule-to", Input).value = ""
+            self.query_one("#schedule-msg", Input).value = ""
+            self.query_one("#schedule-when", Input).value = ""
+            status.update(f"[green]Scheduled for {dt.strftime('%Y-%m-%d %H:%M')}[/green]")
+            self._render_schedule()
+            self.query_one("#schedule-to", Input).focus()
+
     def on_key(self, event):
         pane = self._active_pane()
 
         # Messaging tab
         if pane == "msg-tab":
             if event.key == "escape":
-                if self.msg_view in ("chat", "compose"):
-                    self._close_chat()
+                if self.msg_view in ("chat", "compose", "search", "analytics", "schedule"):
+                    self._back_to_list()
                     event.prevent_default()
                     event.stop()
                     return
@@ -773,8 +1308,56 @@ class M0usuNetApp(App):
                     event.prevent_default()
                     event.stop()
                     return
+                if event.key == "slash":
+                    self._open_search()
+                    event.prevent_default()
+                    event.stop()
+                    return
+                if event.key == "a":
+                    # Analytics for selected conversation
+                    lv = self.query_one("#convo-list", ListView)
+                    if lv.index is not None:
+                        try:
+                            item = lv.children[lv.index]
+                            if isinstance(item, ConversationItem):
+                                c = item.convo
+                                self._open_analytics(c["phone"], c.get("name", c["phone"]))
+                        except:
+                            pass
+                    event.prevent_default()
+                    event.stop()
+                    return
+                if event.key == "dollar_sign" or event.key == "s":
+                    self._open_schedule()
+                    event.prevent_default()
+                    event.stop()
+                    return
+                if event.key == "d":
+                    # Delete scheduled (prompt not ideal in TUI, skip for now)
+                    pass
+            if self.msg_view == "chat":
+                if event.key == "ctrl+g":
+                    self._trigger_wingman()
+                    event.prevent_default()
+                    event.stop()
+                    return
+                if event.key == "a" and not isinstance(self.focused, Input):
+                    self._open_analytics(self.chat_phone, self.chat_name)
+                    event.prevent_default()
+                    event.stop()
+                    return
+            if self.msg_view == "schedule" and not isinstance(self.focused, Input):
+                if event.key == "d":
+                    # Delete most recent pending
+                    pending = [s for s in self.store.scheduled if s.get("status") == "pending"]
+                    if pending:
+                        self.store.remove_scheduled(pending[-1]["id"])
+                        self._render_schedule()
+                    event.prevent_default()
+                    event.stop()
+                    return
 
-        # TV tab controls (only when not typing in input)
+        # TV tab controls
         if pane == "tv-tab" and not isinstance(self.focused, Input):
             if event.key == "space":
                 threading.Thread(
@@ -812,7 +1395,6 @@ class M0usuNetApp(App):
                 event.prevent_default()
 
     def action_quit(self):
-        # Only quit from Home tab when not in an input
         if isinstance(self.focused, Input):
             return
         self.exit()
@@ -821,5 +1403,7 @@ class M0usuNetApp(App):
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "yt":
         cmd_yt(sys.argv[2:])
+    elif len(sys.argv) > 1 and sys.argv[1] == "schedule-check":
+        cmd_schedule_check()
     else:
         M0usuNetApp().run()
