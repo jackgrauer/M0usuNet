@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """M0usuNet - Mesh network hub TUI (runs on Pi)"""
-import curses
+import datetime
+import os
+import re
 import subprocess
 import sys
 import threading
@@ -17,6 +19,77 @@ def run(cmd, timeout=10):
     except:
         return ""
 
+# ── Helpers ──
+
+def normalize_phone(p):
+    digits = re.sub(r'\D', '', p)
+    if len(digits) == 10:
+        digits = '1' + digits
+    if len(digits) == 11 and digits[0] == '1':
+        return '+' + digits
+    return p
+
+def apple_date(ns):
+    try:
+        return datetime.datetime(2001, 1, 1) + datetime.timedelta(seconds=ns / 1e9)
+    except:
+        return datetime.datetime(2001, 1, 1)
+
+def pixel_date(ms):
+    try:
+        return datetime.datetime.fromtimestamp(ms / 1000)
+    except:
+        return datetime.datetime(1970, 1, 1)
+
+def relative_time(dt):
+    now = datetime.datetime.now()
+    delta = now - dt
+    secs = int(delta.total_seconds())
+    if secs < 0:
+        return "now"
+    if secs < 60:
+        return f"{secs}s ago"
+    if secs < 3600:
+        return f"{secs // 60}m ago"
+    if secs < 86400:
+        return f"{secs // 3600}h ago"
+    days = secs // 86400
+    if days == 1:
+        return "yesterday"
+    if days < 7:
+        return f"{days}d ago"
+    return dt.strftime("%b %d")
+
+def load_contacts():
+    contacts = {}
+    raw = run(f"cat {PI_HOME}/contacts.tsv 2>/dev/null", timeout=5)
+    if raw:
+        for line in raw.split('\n'):
+            parts = line.split('\t')
+            if len(parts) == 2:
+                name, phone = parts[0].strip(), parts[1].strip()
+                contacts[normalize_phone(phone)] = name
+    return contacts
+
+def parse_pixel_sms(raw):
+    messages = []
+    if not raw:
+        return messages
+    for line in raw.split('\n'):
+        line = line.strip()
+        if not line.startswith('Row:'):
+            continue
+        msg = {}
+        content = line.split(' ', 2)[-1] if ' ' in line else ''
+        for field in ['address', 'body', 'date', 'type']:
+            pattern = field + r'=(.*?)(?:, (?:address|body|date|type)=|$)'
+            m = re.search(pattern, content)
+            if m:
+                msg[field] = m.group(1).rstrip(', ')
+        if 'address' in msg:
+            messages.append(msg)
+    return messages
+
 # ── Background data store ──
 
 class Store:
@@ -29,6 +102,21 @@ class Store:
         self.msg_history = []
         self._home_thread = None
         self._mpv_thread = None
+        self.contacts = {}
+        self.conversations = []
+        self.chat_messages = []
+        self._conv_thread = None
+        self._chat_thread = None
+        self._contacts_loaded = False
+
+    def ensure_contacts(self):
+        if not self._contacts_loaded:
+            self.contacts = load_contacts()
+            self._contacts_loaded = True
+
+    def resolve_name(self, phone):
+        norm = normalize_phone(phone)
+        return self.contacts.get(norm, phone)
 
     def refresh_home(self):
         if self._home_thread and self._home_thread.is_alive():
@@ -44,6 +132,18 @@ class Store:
 
     def refresh_messages(self):
         threading.Thread(target=self._do_messages, daemon=True).start()
+
+    def refresh_conversations(self):
+        if self._conv_thread and self._conv_thread.is_alive():
+            return
+        self._conv_thread = threading.Thread(target=self._do_conversations, daemon=True)
+        self._conv_thread.start()
+
+    def refresh_chat(self, phone):
+        if self._chat_thread and self._chat_thread.is_alive():
+            return
+        self._chat_thread = threading.Thread(target=self._do_chat, args=(phone,), daemon=True)
+        self._chat_thread.start()
 
     def _do_home(self):
         results = {}
@@ -106,6 +206,142 @@ class Store:
             if raw:
                 self.msg_history = raw.split("\n")
 
+    def _do_conversations(self):
+        self.ensure_contacts()
+        convos = {}
+
+        ipad_raw = run(
+            'ssh -o ConnectTimeout=5 -o BatchMode=yes ipad '
+            '"sqlite3 /var/mobile/Library/SMS/sms.db '
+            '\\"SELECT h.id, m.text, m.is_from_me, m.date, m.service '
+            'FROM message m JOIN handle h ON m.handle_id = h.ROWID '
+            'WHERE m.ROWID IN ('
+            'SELECT MAX(m2.ROWID) FROM message m2 '
+            'JOIN handle h2 ON m2.handle_id = h2.ROWID '
+            'GROUP BY h2.id) '
+            'ORDER BY m.date DESC;\\"" 2>/dev/null',
+            timeout=15
+        )
+        if ipad_raw:
+            for line in ipad_raw.split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 5:
+                    phone = parts[0].strip()
+                    text = parts[1].strip() if parts[1] else ""
+                    is_from_me = parts[2].strip() == '1'
+                    try:
+                        date_val = int(parts[3].strip())
+                    except:
+                        continue
+                    service = parts[4].strip().lower()
+                    dt = apple_date(date_val)
+                    norm = normalize_phone(phone)
+                    svc_tag = "imsg" if "imessage" in service else "sms"
+                    preview = text[:60] if text else ""
+                    if is_from_me and preview:
+                        preview = "you: " + preview
+                    convos[norm] = {
+                        "phone": phone,
+                        "name": self.resolve_name(phone),
+                        "service": svc_tag,
+                        "last_msg": preview,
+                        "last_date": dt,
+                    }
+
+        pixel_raw = run(
+            "adb shell 'content query --uri content://sms "
+            "--projection address:body:date:type "
+            '--sort "date DESC"\' 2>/dev/null',
+            timeout=15
+        )
+        if pixel_raw:
+            pixel_msgs = parse_pixel_sms(pixel_raw)
+            seen = set()
+            for msg in pixel_msgs:
+                addr = msg.get('address', '')
+                norm = normalize_phone(addr)
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                body = msg.get('body', '')[:60]
+                try:
+                    dt = pixel_date(int(msg.get('date', '0')))
+                except:
+                    dt = datetime.datetime(1970, 1, 1)
+                is_from_me = msg.get('type', '') == '2'
+                preview = body
+                if is_from_me and preview:
+                    preview = "you: " + preview
+                if norm not in convos or dt > convos[norm]["last_date"]:
+                    convos[norm] = {
+                        "phone": addr,
+                        "name": self.resolve_name(addr),
+                        "service": "sms",
+                        "last_msg": preview,
+                        "last_date": dt,
+                    }
+
+        sorted_convos = sorted(convos.values(), key=lambda c: c["last_date"], reverse=True)
+        with self.lock:
+            self.conversations = sorted_convos
+
+    def _do_chat(self, phone):
+        self.ensure_contacts()
+        digits = re.sub(r'\D', '', phone)
+        match_digits = digits[-10:] if len(digits) >= 10 else digits
+        messages = []
+
+        ipad_raw = run(
+            'ssh -o ConnectTimeout=5 -o BatchMode=yes ipad '
+            '"sqlite3 /var/mobile/Library/SMS/sms.db '
+            '\\"SELECT m.text, m.is_from_me, m.date, m.service '
+            'FROM message m JOIN handle h ON m.handle_id = h.ROWID '
+            f"WHERE h.id LIKE \'%{match_digits}%\' "
+            'ORDER BY m.date ASC;\\"" 2>/dev/null',
+            timeout=15
+        )
+        if ipad_raw:
+            for line in ipad_raw.split('\n'):
+                parts = line.split('|')
+                if len(parts) >= 4:
+                    text = parts[0].strip() if parts[0] else ""
+                    is_from_me = parts[1].strip() == '1'
+                    try:
+                        date_val = int(parts[2].strip())
+                    except:
+                        continue
+                    service = parts[3].strip().lower()
+                    dt = apple_date(date_val)
+                    svc_tag = "imsg" if "imessage" in service else "sms"
+                    messages.append({
+                        "text": text, "is_from_me": is_from_me,
+                        "date": dt, "service": svc_tag,
+                    })
+
+        pixel_raw = run(
+            f"adb shell 'content query --uri content://sms "
+            f"--projection body:date:type "
+            f'--where "address LIKE \\"%{match_digits}%\\"" '
+            f'--sort "date ASC"\' 2>/dev/null',
+            timeout=15
+        )
+        if pixel_raw:
+            for msg in parse_pixel_sms(pixel_raw):
+                body = msg.get('body', '')
+                try:
+                    dt = pixel_date(int(msg.get('date', '0')))
+                except:
+                    continue
+                is_from_me = msg.get('type', '') == '2'
+                messages.append({
+                    "text": body, "is_from_me": is_from_me,
+                    "date": dt, "service": "sms",
+                })
+
+        messages.sort(key=lambda m: m["date"])
+        with self.lock:
+            self.chat_messages = messages
+
     def get_home(self):
         with self.lock:
             return dict(self.home)
@@ -118,362 +354,472 @@ class Store:
         with self.lock:
             return list(self.msg_history)
 
-# ── Drawing ──
+    def get_conversations(self):
+        with self.lock:
+            return list(self.conversations)
 
-def safe_addstr(stdscr, y, x, s, *args):
-    h, w = stdscr.getmaxyx()
-    if 0 <= y < h and 0 <= x < w:
-        stdscr.addnstr(y, x, s, max(0, w - x - 1), *args)
-
-def draw_tabs(stdscr, active, w):
-    tabs = ["HOME", "MESSAGING", "TV"]
-    stdscr.attron(curses.color_pair(5))
-    safe_addstr(stdscr, 0, 0, " " * (w - 1))
-    x = 1
-    for i, name in enumerate(tabs):
-        if i == active:
-            stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-            safe_addstr(stdscr, 0, x, f" {name} ")
-            stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
-        else:
-            stdscr.attron(curses.color_pair(5))
-            safe_addstr(stdscr, 0, x, f" {name} ")
-        x += len(name) + 3
-    stdscr.attroff(curses.color_pair(5))
-
-def draw_box(stdscr, y, x, h, w, title=""):
-    safe_addstr(stdscr, y, x, "\u250c" + "\u2500" * (w - 2) + "\u2510")
-    for i in range(1, h - 1):
-        safe_addstr(stdscr, y + i, x, "\u2502" + " " * (w - 2) + "\u2502")
-    safe_addstr(stdscr, y + h - 1, x, "\u2514" + "\u2500" * (w - 2) + "\u2518")
-    if title:
-        stdscr.attron(curses.A_BOLD)
-        safe_addstr(stdscr, y, x + 2, f" {title} ")
-        stdscr.attroff(curses.A_BOLD)
-
-def dot(stdscr, y, x, is_up):
-    pair = 2 if is_up else 3
-    stdscr.attron(curses.color_pair(pair))
-    safe_addstr(stdscr, y, x, "\u25cf")
-    stdscr.attroff(curses.color_pair(pair))
-
-def draw_mpv_block(stdscr, y, mpv_str, w, title="NOW PLAYING"):
-    bw = min(w - 2, 58)
-    draw_box(stdscr, y, 1, 4, bw, title)
-    if mpv_str and mpv_str != "off" and "|" in mpv_str:
-        parts = mpv_str.split("|")
-        state, title_s = parts[0], parts[1][:45] if len(parts) > 1 else ""
-        icon = "\u25b6" if state == "playing" else "\u23f8"
-        safe_addstr(stdscr, y + 1, 3, f"{icon} {title_s}", curses.color_pair(2))
-        if len(parts) >= 4:
-            try:
-                pos, dur = float(parts[2]), float(parts[3])
-                pm = f"{int(pos)//60}:{int(pos)%60:02d}"
-                dm = f"{int(dur)//60}:{int(dur)%60:02d}"
-                info = f"  {pm} / {dm}"
-                if len(parts) > 4:
-                    info += f"  vol:{parts[4]}"
-                safe_addstr(stdscr, y + 2, 3, info)
-            except:
-                pass
-    else:
-        stdscr.attron(curses.A_DIM)
-        safe_addstr(stdscr, y + 1, 3, "Nothing playing")
-        stdscr.attroff(curses.A_DIM)
-
-def draw_home(stdscr, data, w):
-    y = 2
-    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-    safe_addstr(stdscr, y, 2, "M 0 u s u N e t")
-    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-    if data.get("loading"):
-        safe_addstr(stdscr, y, 22, "(refreshing...)", curses.A_DIM)
-    y += 2
-
-    bw = min(w - 2, 58)
-    draw_box(stdscr, y, 1, 7, bw, "DEVICES")
-    stdscr.attron(curses.A_BOLD)
-    safe_addstr(stdscr, y + 1, 3, f"{'Device':<10}{'Address':<16}{'Status':<10}{'Role':<10}")
-    stdscr.attroff(curses.A_BOLD)
-    devices = [
-        ("Pi",    "192.168.0.19",  True,              "hub"),
-        ("iPad",  "192.168.0.11",  data.get("ipad"),  "iMessage"),
-        ("Pixel", "USB/ADB",       data.get("pixel"), "apps"),
-        ("Mac",   "100.82.246.99", data.get("mac"),   "SMS relay"),
-    ]
-    for i, (name, addr, up_st, role) in enumerate(devices):
-        row = y + 2 + i
-        safe_addstr(stdscr, row, 3, f"{name:<10}{addr:<16}")
-        dot(stdscr, row, 29, up_st)
-        safe_addstr(stdscr, row, 31, f"{'up' if up_st else 'down':<8}{role}")
-    y += 8
-
-    draw_box(stdscr, y, 1, 5, min(bw, 42), "SERVICES")
-    for i, (name, val) in enumerate([
-        ("iPad watchdog",  data.get("ipad_wd") == "active"),
-        ("Pixel watchdog", data.get("pixel_wd") == "active"),
-    ]):
-        row = y + 1 + i
-        safe_addstr(stdscr, row, 3, f"{name:<20}")
-        dot(stdscr, row, 23, val)
-        safe_addstr(stdscr, row, 25, "running" if val else "stopped")
-    y += 6
-
-    draw_mpv_block(stdscr, y, data.get("mpv", "off"), w)
-    y += 5
-
-    draw_box(stdscr, y, 1, 3, bw, "LAST MESSAGE")
-    msg = data.get("lastmsg", "")
-    if msg:
-        safe_addstr(stdscr, y + 1, 3, msg[:bw - 4])
-    else:
-        stdscr.attron(curses.A_DIM)
-        safe_addstr(stdscr, y + 1, 3, "No messages")
-        stdscr.attroff(curses.A_DIM)
-    y += 4
-
-    stdscr.attron(curses.A_DIM)
-    safe_addstr(stdscr, y, 2, f"Pi {data.get('uptime', '')}")
-    stdscr.attroff(curses.A_DIM)
-
-def draw_messaging(stdscr, msg_input, msg_status, msg_history, w):
-    y = 2
-    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-    safe_addstr(stdscr, y, 2, "MESSAGING")
-    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-    y += 2
-
-    bw = min(w - 2, 58)
-    draw_box(stdscr, y, 1, 5, bw, "SEND")
-    safe_addstr(stdscr, y + 1, 3, "To:  ", curses.A_BOLD)
-    safe_addstr(stdscr, y + 2, 3, "Msg: ", curses.A_BOLD)
-    if msg_input["field"] == "to":
-        safe_addstr(stdscr, y + 1, 8, msg_input["to"] + "\u2588")
-        safe_addstr(stdscr, y + 2, 8, msg_input["msg"])
-    else:
-        safe_addstr(stdscr, y + 1, 8, msg_input["to"])
-        safe_addstr(stdscr, y + 2, 8, msg_input["msg"] + "\u2588")
-    if msg_status:
-        safe_addstr(stdscr, y + 3, 3, msg_status[:bw - 4], curses.color_pair(2))
-    y += 6
-
-    rh = min(12, curses.LINES - y - 3)
-    draw_box(stdscr, y, 1, rh, bw, "RECENT")
-    for i, line in enumerate(msg_history[-(rh - 2):]):
-        safe_addstr(stdscr, y + 1 + i, 3, line[:bw - 4])
-    y += rh + 1
-
-    stdscr.attron(curses.A_DIM)
-    safe_addstr(stdscr, curses.LINES - 2, 2, "Enter=next field/send  Esc=clear  Tab=switch tab")
-    stdscr.attroff(curses.A_DIM)
-
-def draw_tv(stdscr, tv_input, tv_status, mpv_info, w):
-    y = 2
-    stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
-    safe_addstr(stdscr, y, 2, "TV")
-    stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
-    y += 2
-
-    bw = min(w - 2, 58)
-    draw_box(stdscr, y, 1, 3, bw, "PLAY URL")
-    safe_addstr(stdscr, y + 1, 3, tv_input + "\u2588")
-    y += 4
-
-    draw_mpv_block(stdscr, y, mpv_info, w)
-    y += 5
-
-    if tv_status:
-        safe_addstr(stdscr, y, 3, tv_status[:52], curses.color_pair(2))
-        y += 2
-
-    draw_box(stdscr, y, 1, 7, min(bw, 42), "CONTROLS")
-    for i, c in enumerate([
-        "Space  = pause/resume",
-        "s      = stop",
-        "<- / ->  = seek -10s / +10s",
-        "+ / -  = volume up/down",
-        "Enter  = play URL above",
-    ]):
-        safe_addstr(stdscr, y + 1 + i, 3, c)
+    def get_chat_messages(self):
+        with self.lock:
+            return list(self.chat_messages)
 
 # ── Subcommand passthrough ──
 
 def cmd_yt(args):
-    """yt subcommand: pass through to yt.sh"""
-    import os
     os.execvp(f"{PI_HOME}/yt.sh", [f"{PI_HOME}/yt.sh"] + args)
 
-# ── Main ──
+# ── Textual TUI ──
 
-def main(stdscr):
-    curses.curs_set(0)
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
-    curses.init_pair(2, curses.COLOR_GREEN, -1)
-    curses.init_pair(3, curses.COLOR_RED, -1)
-    curses.init_pair(4, curses.COLOR_CYAN, -1)
-    curses.init_pair(5, curses.COLOR_WHITE, curses.COLOR_BLACK)
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Vertical, VerticalScroll
+from textual.widgets import (
+    Footer, Header, Input, ListItem, ListView,
+    RichLog, Static, TabbedContent, TabPane,
+)
+from rich.markup import escape
 
-    stdscr.timeout(200)
-    stdscr.keypad(True)
 
-    # Reduce flicker: use erase() not clear(), and
-    # noutrefresh()+doupdate() for atomic screen update
+class ConversationItem(ListItem):
+    def __init__(self, convo):
+        super().__init__()
+        self.convo = convo
 
-    store = Store()
-    tab = 0
-    last_home_kick = 0
-    last_mpv_kick = 0
+    def compose(self):
+        name = escape(self.convo.get("name", self.convo.get("phone", "?")))
+        svc = self.convo.get("service", "?")
+        dt = self.convo.get("last_date")
+        time_str = relative_time(dt) if dt else ""
+        preview = escape(self.convo.get("last_msg", "")[:50])
+        yield Static(
+            f"[bold]{name}[/bold]  \\[{svc}] [dim]{time_str}[/dim]\n"
+            f"  [dim]{preview}[/dim]"
+        )
 
-    msg_input = {"to": "", "msg": "", "field": "to"}
-    msg_status = ""
-    tv_input = ""
-    tv_status = ""
 
-    dirty = True  # Need initial draw
-    prev_snapshot = None  # Track data changes between frames
+class M0usuNetApp(App):
+    TITLE = "M0usuNet"
 
-    store.refresh_home()
-    store.refresh_messages()
+    CSS = """
+    Screen { background: $surface; }
 
-    while True:
+    #home-scroll { height: 1fr; padding: 1 2; }
+
+    #convo-list { height: 1fr; }
+    #chat-container { height: 1fr; display: none; }
+    #compose-container { height: auto; display: none; padding: 1 2; }
+
+    #chat-header { height: 1; padding: 0 1; background: $primary-background; }
+    #chat-log { height: 1fr; }
+    #chat-input { dock: bottom; }
+
+    ConversationItem { height: 3; }
+
+    #tv-scroll { height: 1fr; padding: 1 2; }
+    #mpv-status { height: 4; border: solid $primary; padding: 0 1; margin: 1 0; }
+    #tv-help { margin: 1 0; }
+    """
+
+    BINDINGS = [
+        Binding("q", "quit", "Quit", priority=True),
+    ]
+
+    def __init__(self):
+        super().__init__()
+        self.store = Store()
+        self.msg_view = "list"
+        self.chat_phone = None
+        self.chat_name = ""
+        self.chat_svc = ""
+        self._last_home_snap = None
+        self._last_convos_snap = None
+        self._last_chat_snap = None
+        self._last_mpv_snap = None
+
+    def compose(self):
+        yield Header()
+        with TabbedContent("Home", "Messaging", "TV"):
+            with TabPane("Home", id="home-tab"):
+                with VerticalScroll(id="home-scroll"):
+                    yield Static(id="home-content")
+            with TabPane("Messaging", id="msg-tab"):
+                yield ListView(id="convo-list")
+                with Vertical(id="chat-container"):
+                    yield Static("", id="chat-header")
+                    yield RichLog(id="chat-log", markup=True)
+                    yield Input(placeholder="Type a message...", id="chat-input")
+                with Vertical(id="compose-container"):
+                    yield Static("[bold]NEW MESSAGE[/bold]", id="compose-title")
+                    yield Input(placeholder="To (name or number)", id="compose-to")
+                    yield Input(placeholder="Message", id="compose-msg")
+                    yield Static("", id="compose-status")
+            with TabPane("TV", id="tv-tab"):
+                with VerticalScroll(id="tv-scroll"):
+                    yield Input(placeholder="Paste URL to play", id="tv-input")
+                    yield Static("", id="mpv-status")
+                    yield Static(
+                        "[bold]CONTROLS[/bold]\n"
+                        "  Space  = pause/resume\n"
+                        "  s      = stop\n"
+                        "  <- / ->  = seek -10s / +10s\n"
+                        "  + / -  = volume up/down\n"
+                        "  Enter  = play URL above\n"
+                        "  Tab    = focus URL input",
+                        id="tv-help"
+                    )
+        yield Footer()
+
+    def on_mount(self):
+        self.store.refresh_home()
+        self.store.refresh_conversations()
+        self.set_interval(1.5, self._tick)
+
+    def _active_pane(self):
+        try:
+            return self.query_one(TabbedContent).active
+        except:
+            return ""
+
+    def _tick(self):
+        pane = self._active_pane()
+        if pane == "home-tab":
+            self._update_home()
+        elif pane == "msg-tab":
+            if self.msg_view == "list":
+                self._update_conversations()
+            elif self.msg_view == "chat":
+                self._update_chat()
+        elif pane == "tv-tab":
+            self._update_mpv()
+
+    # ── Home ──
+
+    _home_kick = 0
+
+    def _update_home(self):
         now = time.time()
+        if now - self._home_kick > 10:
+            self.store.refresh_home()
+            self._home_kick = now
 
-        # Kick background refreshes on schedule
-        if tab == 0 and now - last_home_kick > 10:
-            store.refresh_home()
-            last_home_kick = now
-        if tab == 2 and now - last_mpv_kick > 3:
-            store.refresh_mpv()
-            last_mpv_kick = now
+        data = self.store.get_home()
+        snap = repr(data)
+        if snap == self._last_home_snap:
+            return
+        self._last_home_snap = snap
 
-        # Check if background data changed (mark dirty if so)
-        if tab == 0:
-            snap = repr(store.get_home())
-        elif tab == 1:
-            snap = repr(store.get_messages()) + msg_status
-        elif tab == 2:
-            snap = repr(store.get_mpv()) + tv_status
-        if snap != prev_snapshot:
-            prev_snapshot = snap
-            dirty = True
+        lines = ["[bold cyan]M 0 u s u N e t[/bold cyan]\n"]
+        if data.get("loading"):
+            lines.append("[dim]refreshing...[/dim]\n")
 
-        # Only redraw when something changed
-        if dirty:
-            h, w = stdscr.getmaxyx()
-            stdscr.erase()
+        lines.append("[bold]DEVICES[/bold]")
+        lines.append(f"  {'Device':<10}{'Address':<16}{'Status':<10}{'Role'}")
+        for name, addr, up, role in [
+            ("Pi",    "192.168.0.19",  True,              "hub"),
+            ("iPad",  "192.168.0.11",  data.get("ipad"),  "iMessage"),
+            ("Pixel", "USB/ADB",       data.get("pixel"), "apps"),
+            ("Mac",   "100.82.246.99", data.get("mac"),   "SMS relay"),
+        ]:
+            dot = "[green]\u25cf[/green]" if up else "[red]\u25cf[/red]"
+            st = "up" if up else "down"
+            lines.append(f"  {name:<10}{addr:<16}{dot} {st:<8}{role}")
 
-            draw_tabs(stdscr, tab, w)
+        lines.append(f"\n[bold]SERVICES[/bold]")
+        for name, active in [
+            ("iPad watchdog",  data.get("ipad_wd") == "active"),
+            ("Pixel watchdog", data.get("pixel_wd") == "active"),
+        ]:
+            dot = "[green]\u25cf[/green]" if active else "[red]\u25cf[/red]"
+            lines.append(f"  {name:<20} {dot} {'running' if active else 'stopped'}")
 
-            if tab == 0:
-                draw_home(stdscr, store.get_home(), w)
-            elif tab == 1:
-                draw_messaging(stdscr, msg_input, msg_status, store.get_messages(), w)
-            elif tab == 2:
-                draw_tv(stdscr, tv_input, tv_status, store.get_mpv(), w)
+        mpv = data.get("mpv", "off")
+        lines.append(f"\n[bold]NOW PLAYING[/bold]")
+        if mpv and mpv != "off" and "|" in mpv:
+            parts = mpv.split("|")
+            state = parts[0]
+            title = parts[1][:45] if len(parts) > 1 else ""
+            icon = "\u25b6" if state == "playing" else "\u23f8"
+            line = f"  {icon} {escape(title)}"
+            if len(parts) >= 4:
+                try:
+                    pos, dur = float(parts[2]), float(parts[3])
+                    line += f"  {int(pos)//60}:{int(pos)%60:02d}/{int(dur)//60}:{int(dur)%60:02d}"
+                except:
+                    pass
+            lines.append(line)
+        else:
+            lines.append("  [dim]Nothing playing[/dim]")
 
-            stdscr.attron(curses.A_DIM)
-            safe_addstr(stdscr, h - 1, 1, " Tab=next tab  q=quit (from HOME) ")
-            stdscr.attroff(curses.A_DIM)
+        msg = data.get("lastmsg", "")
+        lines.append(f"\n[bold]LAST MESSAGE[/bold]")
+        lines.append(f"  {escape(msg) if msg else '[dim]No messages[/dim]'}")
 
-            stdscr.noutrefresh()
-            curses.doupdate()
-            dirty = False
+        uptime = data.get("uptime", "")
+        if uptime:
+            lines.append(f"\n[dim]Pi {escape(uptime)}[/dim]")
+
+        self.query_one("#home-content", Static).update("\n".join(lines))
+
+    # ── Conversations ──
+
+    _conv_kick = 0
+
+    def _update_conversations(self):
+        now = time.time()
+        if now - self._conv_kick > 15:
+            self.store.refresh_conversations()
+            self._conv_kick = now
+
+        convos = self.store.get_conversations()
+        snap = repr(convos)
+        if snap == self._last_convos_snap:
+            return
+        self._last_convos_snap = snap
+
+        lv = self.query_one("#convo-list", ListView)
+        saved = lv.index
+        lv.clear()
+        if not convos:
+            lv.append(ListItem(Static("[dim]No conversations. Press r to refresh.[/dim]")))
+        else:
+            for convo in convos:
+                lv.append(ConversationItem(convo))
+            if saved is not None and 0 <= saved < len(convos):
+                lv.index = saved
+
+    def _open_chat(self, convo):
+        self.chat_phone = convo["phone"]
+        self.chat_name = convo.get("name", convo["phone"])
+        self.chat_svc = convo.get("service", "?")
+        self.msg_view = "chat"
+        self._last_chat_snap = None
+
+        self.query_one("#convo-list").display = False
+        self.query_one("#compose-container").display = False
+        self.query_one("#chat-container").display = True
+        self.query_one("#chat-header", Static).update(
+            f"[bold cyan]{escape(self.chat_name)}[/bold cyan] \\[{self.chat_svc}]"
+        )
+
+        chat_log = self.query_one("#chat-log", RichLog)
+        chat_log.clear()
+        chat_log.write("[dim]Loading...[/dim]")
+
+        self.store.refresh_chat(self.chat_phone)
+        self.query_one("#chat-input", Input).focus()
+
+    def _update_chat(self):
+        msgs = self.store.get_chat_messages()
+        snap = repr(msgs)
+        if snap == self._last_chat_snap:
+            return
+        self._last_chat_snap = snap
+
+        chat_log = self.query_one("#chat-log", RichLog)
+        chat_log.clear()
+        for msg in msgs:
+            text = msg.get("text", "")
+            if not text:
+                continue
+            if msg.get("is_from_me"):
+                chat_log.write(f"[cyan]you:[/cyan]  {escape(text)}")
+            else:
+                chat_log.write(f"[bold]them:[/bold] {escape(text)}")
+        chat_log.scroll_end(animate=False)
+
+    def _close_chat(self):
+        self.msg_view = "list"
+        self._last_convos_snap = None  # force refresh
+        self.query_one("#chat-container").display = False
+        self.query_one("#compose-container").display = False
+        self.query_one("#convo-list").display = True
+        self.store.refresh_conversations()
+        self.query_one("#convo-list", ListView).focus()
+
+    def _open_compose(self):
+        self.msg_view = "compose"
+        self.query_one("#convo-list").display = False
+        self.query_one("#chat-container").display = False
+        self.query_one("#compose-container").display = True
+        self.query_one("#compose-to", Input).value = ""
+        self.query_one("#compose-msg", Input).value = ""
+        self.query_one("#compose-status", Static).update("")
+        self.query_one("#compose-to", Input).focus()
+
+    # ── TV ──
+
+    _mpv_kick = 0
+
+    def _update_mpv(self):
+        now = time.time()
+        if now - self._mpv_kick > 3:
+            self.store.refresh_mpv()
+            self._mpv_kick = now
+
+        mpv = self.store.get_mpv()
+        if mpv == self._last_mpv_snap:
+            return
+        self._last_mpv_snap = mpv
 
         try:
-            ch = stdscr.getch()
+            widget = self.query_one("#mpv-status", Static)
         except:
-            continue
+            return
 
-        if ch == -1:
-            continue
+        if mpv and mpv != "off" and "|" in mpv:
+            parts = mpv.split("|")
+            state = parts[0]
+            title = parts[1][:45] if len(parts) > 1 else ""
+            icon = "\u25b6" if state == "playing" else "\u23f8"
+            info = f"{icon} [green]{escape(title)}[/green]"
+            if len(parts) >= 4:
+                try:
+                    pos, dur = float(parts[2]), float(parts[3])
+                    info += f"\n  {int(pos)//60}:{int(pos)%60:02d} / {int(dur)//60}:{int(dur)%60:02d}"
+                    if len(parts) > 4:
+                        info += f"  vol:{parts[4]}"
+                except:
+                    pass
+            widget.update(info)
+        else:
+            widget.update("[dim]Nothing playing[/dim]")
 
-        dirty = True  # Any keypress triggers redraw
+    # ── Events ──
 
-        if ch == curses.KEY_RESIZE:
-            continue
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated):
+        pane_id = event.pane.id
+        if pane_id == "home-tab":
+            self._home_kick = 0  # force immediate refresh
+        elif pane_id == "msg-tab":
+            self._conv_kick = 0
+        elif pane_id == "tv-tab":
+            self._mpv_kick = 0
 
-        if ch == 9:  # Tab = next tab
-            tab = (tab + 1) % 3
-            if tab == 0:
-                store.refresh_home()
-                last_home_kick = now
-            elif tab == 1:
-                store.refresh_messages()
-            elif tab == 2:
-                store.refresh_mpv()
-                last_mpv_kick = now
-            continue
+    def on_list_view_selected(self, event: ListView.Selected):
+        if isinstance(event.item, ConversationItem):
+            self._open_chat(event.item.convo)
 
-        if tab == 0:
-            if ch == ord('q'):
-                break
+    def on_input_submitted(self, event: Input.Submitted):
+        if event.input.id == "chat-input":
+            text = event.value.strip()
+            if not text:
+                return
+            event.input.value = ""
+            phone = self.chat_phone
+            chat_log = self.query_one("#chat-log", RichLog)
+            chat_log.write(f"[cyan]you:[/cyan]  {escape(text)}")
+            chat_log.scroll_end(animate=False)
+            def send(t=text, p=phone):
+                escaped = t.replace("'", "'\\''")
+                run(f"{PI_HOME}/relay.sh '{p}' '{escaped}'", timeout=15)
+                time.sleep(1)
+                self.store.refresh_chat(p)
+                self._last_chat_snap = None  # force UI update
+            threading.Thread(target=send, daemon=True).start()
 
-        elif tab == 1:
-            if ch == 27:
-                msg_input = {"to": "", "msg": "", "field": "to"}
-                msg_status = ""
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                f = msg_input["field"]
-                msg_input[f] = msg_input[f][:-1]
-            elif ch == 10:
-                if msg_input["to"] and msg_input["msg"]:
-                    msg_status = "Sending..."
-                    to_addr = msg_input["to"]
-                    msg_text = msg_input["msg"]
-                    def send():
-                        nonlocal msg_status
-                        result = run(f'{PI_HOME}/relay.sh {to_addr} {msg_text}', timeout=15)
-                        msg_status = result if result else "Sent"
-                        store.refresh_messages()
-                    threading.Thread(target=send, daemon=True).start()
-                    msg_input["msg"] = ""
-                elif msg_input["field"] == "to" and msg_input["to"]:
-                    msg_input["field"] = "msg"
-            elif 32 <= ch <= 126:
-                msg_input[msg_input["field"]] += chr(ch)
+        elif event.input.id == "tv-input":
+            url = event.value.strip()
+            if not url:
+                return
+            event.input.value = ""
+            self.set_focus(None)  # blur so TV controls work
+            def play(u=url):
+                run(f"{PI_HOME}/yt.sh '{u}'", timeout=20)
+                time.sleep(2)
+                self._mpv_kick = 0
+            threading.Thread(target=play, daemon=True).start()
 
-        elif tab == 2:
-            if ch == ord(' '):
-                threading.Thread(target=lambda: run(f"{PI_HOME}/yt.sh pause"), daemon=True).start()
-                time.sleep(0.3)
-                store.refresh_mpv()
-            elif ch == ord('s'):
-                threading.Thread(target=lambda: run(f"{PI_HOME}/yt.sh stop"), daemon=True).start()
-                tv_status = "Stopped"
-            elif ch == curses.KEY_RIGHT:
-                threading.Thread(target=lambda: run(f"{PI_HOME}/yt.sh seek 10"), daemon=True).start()
-            elif ch == curses.KEY_LEFT:
-                threading.Thread(target=lambda: run(f"{PI_HOME}/yt.sh seek -10"), daemon=True).start()
-            elif ch == ord('+') or ch == ord('='):
-                threading.Thread(target=lambda: run(f"{PI_HOME}/yt.sh vol 80"), daemon=True).start()
-                store.refresh_mpv()
-            elif ch == ord('-'):
-                threading.Thread(target=lambda: run(f"{PI_HOME}/yt.sh vol 40"), daemon=True).start()
-                store.refresh_mpv()
-            elif ch == 10:
-                if tv_input:
-                    url = tv_input
-                    tv_input = ""
-                    tv_status = "Loading..."
-                    def play():
-                        nonlocal tv_status
-                        result = run(f"{PI_HOME}/yt.sh '{url}'", timeout=20)
-                        tv_status = result if result else "Playing"
-                        time.sleep(2)
-                        store.refresh_mpv()
-                    threading.Thread(target=play, daemon=True).start()
-            elif ch in (curses.KEY_BACKSPACE, 127, 8):
-                tv_input = tv_input[:-1]
-            elif ch == 27:
-                tv_input = ""
-                tv_status = ""
-            elif 32 <= ch <= 126:
-                tv_input += chr(ch)
+        elif event.input.id == "compose-to":
+            self.query_one("#compose-msg", Input).focus()
+
+        elif event.input.id == "compose-msg":
+            to_val = self.query_one("#compose-to", Input).value.strip()
+            msg_val = event.value.strip()
+            if not (to_val and msg_val):
+                return
+            event.input.value = ""
+            status = self.query_one("#compose-status", Static)
+            status.update("[dim]Sending...[/dim]")
+            def send(to=to_val, txt=msg_val):
+                escaped = txt.replace("'", "'\\''")
+                to_esc = to.replace("'", "'\\''")
+                result = run(f"{PI_HOME}/relay.sh '{to_esc}' '{escaped}'", timeout=15)
+                msg = result if result else "Sent"
+                self.call_from_thread(lambda: status.update(msg))
+                self.store.refresh_conversations()
+                self._last_convos_snap = None
+            threading.Thread(target=send, daemon=True).start()
+
+    def on_key(self, event):
+        pane = self._active_pane()
+
+        # Messaging tab
+        if pane == "msg-tab":
+            if event.key == "escape":
+                if self.msg_view in ("chat", "compose"):
+                    self._close_chat()
+                    event.prevent_default()
+                    event.stop()
+                    return
+            if self.msg_view == "list" and not isinstance(self.focused, Input):
+                if event.key == "n":
+                    self._open_compose()
+                    event.prevent_default()
+                    event.stop()
+                    return
+                if event.key == "r":
+                    self._conv_kick = 0
+                    self.store.refresh_conversations()
+                    self._last_convos_snap = None
+                    event.prevent_default()
+                    event.stop()
+                    return
+
+        # TV tab controls (only when not typing in input)
+        if pane == "tv-tab" and not isinstance(self.focused, Input):
+            if event.key == "space":
+                threading.Thread(
+                    target=lambda: run(f"{PI_HOME}/yt.sh pause"), daemon=True
+                ).start()
+                self._mpv_kick = 0
+                event.prevent_default()
+            elif event.key == "s":
+                threading.Thread(
+                    target=lambda: run(f"{PI_HOME}/yt.sh stop"), daemon=True
+                ).start()
+                self._mpv_kick = 0
+                event.prevent_default()
+            elif event.key == "right":
+                threading.Thread(
+                    target=lambda: run(f"{PI_HOME}/yt.sh seek 10"), daemon=True
+                ).start()
+                event.prevent_default()
+            elif event.key == "left":
+                threading.Thread(
+                    target=lambda: run(f"{PI_HOME}/yt.sh seek -10"), daemon=True
+                ).start()
+                event.prevent_default()
+            elif event.key in ("plus", "equal"):
+                threading.Thread(
+                    target=lambda: run(f"{PI_HOME}/yt.sh vol 80"), daemon=True
+                ).start()
+                self._mpv_kick = 0
+                event.prevent_default()
+            elif event.key == "minus":
+                threading.Thread(
+                    target=lambda: run(f"{PI_HOME}/yt.sh vol 40"), daemon=True
+                ).start()
+                self._mpv_kick = 0
+                event.prevent_default()
+
+    def action_quit(self):
+        # Only quit from Home tab when not in an input
+        if isinstance(self.focused, Input):
+            return
+        self.exit()
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "yt":
         cmd_yt(sys.argv[2:])
     else:
-        curses.wrapper(main)
+        M0usuNetApp().run()
