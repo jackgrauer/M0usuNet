@@ -23,9 +23,10 @@ def _adb(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess:
 def _pull_bugle_db(timeout: float = 15.0) -> bool:
     """Copy bugle_db + WAL + SHM off Pixel via ADB. Returns True on success."""
     try:
-        # Copy all three files on-device (DB, WAL, SHM) so we get a consistent snapshot
+        # Checkpoint WAL into main DB first for a clean snapshot, then copy
         r = _adb(["shell", (
             f"su -c '"
+            f"sqlite3 {BUGLE_DB} \"PRAGMA wal_checkpoint(TRUNCATE)\" 2>/dev/null; "
             f"cp {BUGLE_DB} {STAGING} && "
             f"cp {BUGLE_DB}-wal {STAGING}-wal 2>/dev/null; "
             f"cp {BUGLE_DB}-shm {STAGING}-shm 2>/dev/null; "
@@ -41,7 +42,7 @@ def _pull_bugle_db(timeout: float = 15.0) -> bool:
             log.warning("ADB pull DB failed: %s", r.stderr.strip())
             return False
 
-        # Pull WAL and SHM (optional — may not exist if DB is in journal mode)
+        # Pull WAL and SHM (optional — may not exist after checkpoint)
         _adb(["pull", f"{STAGING}-wal", f"{LOCAL_BUGLE}-wal"], timeout=timeout)
         _adb(["pull", f"{STAGING}-shm", f"{LOCAL_BUGLE}-shm"], timeout=timeout)
 
@@ -67,12 +68,21 @@ def _epoch_ms_to_iso(ms: int) -> str:
     return dt.isoformat()
 
 
-def _get_self_participant_id(conn: sqlite3.Connection) -> int | None:
-    """Find the participant_id that represents the Pixel owner."""
-    row = conn.execute(
-        "SELECT participant_id FROM self_participants LIMIT 1"
-    ).fetchone()
-    return row[0] if row else None
+def _get_self_participant_ids(conn: sqlite3.Connection) -> set[int]:
+    """Find all participant_ids that represent the Pixel owner.
+
+    The Pixel may have had multiple SIMs, each creating a separate
+    self_participants entry with a different participant_id.
+    """
+    try:
+        rows = conn.execute(
+            "SELECT participant_id FROM self_participants"
+        ).fetchall()
+        return {r[0] for r in rows if r[0] is not None}
+    except sqlite3.OperationalError:
+        # Table missing (WAL not applied) — fall back to message_status heuristic
+        log.debug("self_participants table unavailable, using status heuristic")
+        return set()
 
 
 def fetch_pixel_messages(since_ms: int = 0) -> list[dict]:
@@ -93,7 +103,7 @@ def fetch_pixel_messages(since_ms: int = 0) -> list[dict]:
         return []
 
     try:
-        self_pid = _get_self_participant_id(conn)
+        self_pids = _get_self_participant_ids(conn)
 
         rows = conn.execute("""
             SELECT
@@ -102,6 +112,7 @@ def fetch_pixel_messages(since_ms: int = 0) -> list[dict]:
                 m.sent_timestamp,
                 m.sender_id,
                 m.conversation_id,
+                m.message_status,
                 p.text
             FROM messages m
             JOIN parts p ON p.message_id = m._id
@@ -112,15 +123,19 @@ def fetch_pixel_messages(since_ms: int = 0) -> list[dict]:
             LIMIT 500
         """, (since_ms,)).fetchall()
 
-        # Build conversation -> phone lookup
+        # Build conversation -> phone lookup (excluding self participants)
         conv_phones: dict[int, str] = {}
         for r in conn.execute("""
-            SELECT cp.conversation_id, pa.normalized_destination
+            SELECT cp.conversation_id, pa._id, pa.normalized_destination
             FROM conversation_participants cp
             JOIN participants pa ON pa._id = cp.participant_id
             WHERE pa.normalized_destination IS NOT NULL
         """).fetchall():
-            conv_phones[r[0]] = r[1]
+            pid = r[1]
+            # Skip self participants so we get the other person's phone
+            if pid in self_pids:
+                continue
+            conv_phones[r[0]] = r[2]
 
         messages = []
         seen_ids: set[int] = set()
@@ -135,7 +150,13 @@ def fetch_pixel_messages(since_ms: int = 0) -> list[dict]:
             if not phone:
                 continue
 
-            is_from_me = (r["sender_id"] == self_pid) if self_pid else False
+            # Determine direction: check self_pids first, fall back to status
+            if self_pids:
+                is_from_me = r["sender_id"] in self_pids
+            else:
+                # message_status < 100 = outbound, >= 100 = inbound
+                is_from_me = (r["message_status"] or 0) < 100
+
             ts = r["received_timestamp"] or r["sent_timestamp"] or 0
 
             messages.append({
