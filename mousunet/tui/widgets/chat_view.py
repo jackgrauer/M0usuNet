@@ -47,8 +47,8 @@ def _to_local(dt: datetime) -> datetime:
     """Convert a datetime to local time. Handles both aware and naive datetimes."""
     if dt.tzinfo is not None:
         return dt.astimezone()
-    # Naive datetime — assume it's already local
-    return dt
+    # Naive datetime — SQLite CURRENT_TIMESTAMP is UTC
+    return dt.replace(tzinfo=timezone.utc).astimezone()
 
 
 def _date_label(d: date) -> str:

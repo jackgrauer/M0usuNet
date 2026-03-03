@@ -236,7 +236,7 @@ class ConversationItem(Widget):
         time_str = ""
         if c.last_time:
             today = __import__("datetime").date.today()
-            local_time = c.last_time.astimezone() if c.last_time.tzinfo else c.last_time
+            local_time = c.last_time.astimezone() if c.last_time.tzinfo else c.last_time.replace(tzinfo=__import__("datetime").timezone.utc).astimezone()
             if local_time.date() == today:
                 time_str = local_time.strftime("%-I:%M%p").lower()
             else:
