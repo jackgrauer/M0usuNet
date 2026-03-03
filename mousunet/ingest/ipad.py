@@ -35,7 +35,7 @@ def apple_ts_to_iso(apple_ns: int) -> str:
     return dt.isoformat()
 
 
-def fetch_ipad_messages(since_apple_ts: int = 0, timeout: float = 15.0) -> list[dict]:
+def fetch_ipad_messages(since_apple_ts: int = 0, timeout: float = 30.0) -> list[dict]:
     """SSH to iPad and query SMS.db for new messages.
 
     Args:
@@ -47,7 +47,11 @@ def fetch_ipad_messages(since_apple_ts: int = 0, timeout: float = 15.0) -> list[
     """
     sql = QUERY.strip().replace("\n", " ")
     cmd = [
-        "ssh", "ipad",
+        "ssh",
+        "-o", "ConnectTimeout=10",
+        "-o", "ServerAliveInterval=5",
+        "-o", "ServerAliveCountMax=3",
+        "ipad",
         f"sqlite3 -separator '|' /var/mobile/Library/SMS/sms.db \"{sql.replace('?', str(since_apple_ts))}\""
     ]
 
@@ -62,7 +66,10 @@ def fetch_ipad_messages(since_apple_ts: int = 0, timeout: float = 15.0) -> list[
 
     if result.returncode != 0:
         stderr = result.stderr.strip()
-        if stderr:
+        # Connection refused / host down is normal when iPad is asleep
+        if "Connection refused" in stderr or "No route" in stderr or "timed out" in stderr:
+            log.debug("iPad offline: %s", stderr)
+        elif stderr:
             log.warning("iPad query error: %s", stderr)
         return []
 

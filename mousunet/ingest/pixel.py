@@ -14,24 +14,36 @@ STAGING = "/sdcard/mousunet_bugle.tmp"
 LOCAL_BUGLE = Path("/tmp/mousunet_bugle_db")
 
 
+def _adb(args: list[str], timeout: float = 15.0) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["adb"] + args, capture_output=True, text=True, timeout=timeout,
+    )
+
+
 def _pull_bugle_db(timeout: float = 15.0) -> bool:
-    """Copy bugle_db off Pixel via ADB. Returns True on success."""
+    """Copy bugle_db + WAL + SHM off Pixel via ADB. Returns True on success."""
     try:
-        r = subprocess.run(
-            ["adb", "shell", f"su -c 'cp {BUGLE_DB} {STAGING}'"],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        # Copy all three files on-device (DB, WAL, SHM) so we get a consistent snapshot
+        r = _adb(["shell", (
+            f"su -c '"
+            f"cp {BUGLE_DB} {STAGING} && "
+            f"cp {BUGLE_DB}-wal {STAGING}-wal 2>/dev/null; "
+            f"cp {BUGLE_DB}-shm {STAGING}-shm 2>/dev/null; "
+            f"true'"
+        )], timeout=timeout)
         if r.returncode != 0:
             log.warning("ADB su cp failed: %s", r.stderr.strip())
             return False
 
-        r = subprocess.run(
-            ["adb", "pull", STAGING, str(LOCAL_BUGLE)],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        # Pull main DB (required)
+        r = _adb(["pull", STAGING, str(LOCAL_BUGLE)], timeout=timeout)
         if r.returncode != 0:
-            log.warning("ADB pull failed: %s", r.stderr.strip())
+            log.warning("ADB pull DB failed: %s", r.stderr.strip())
             return False
+
+        # Pull WAL and SHM (optional — may not exist if DB is in journal mode)
+        _adb(["pull", f"{STAGING}-wal", f"{LOCAL_BUGLE}-wal"], timeout=timeout)
+        _adb(["pull", f"{STAGING}-shm", f"{LOCAL_BUGLE}-shm"], timeout=timeout)
 
         return True
     except subprocess.TimeoutExpired:
@@ -40,6 +52,13 @@ def _pull_bugle_db(timeout: float = 15.0) -> bool:
     except Exception as e:
         log.warning("ADB pull error: %s", e)
         return False
+
+
+def _cleanup_local() -> None:
+    """Remove local copies of bugle_db files."""
+    for suffix in ("", "-wal", "-shm"):
+        p = Path(f"{LOCAL_BUGLE}{suffix}")
+        p.unlink(missing_ok=True)
 
 
 def _epoch_ms_to_iso(ms: int) -> str:
@@ -70,6 +89,7 @@ def fetch_pixel_messages(since_ms: int = 0) -> list[dict]:
         conn.row_factory = sqlite3.Row
     except Exception as e:
         log.warning("Failed to open pulled bugle_db: %s", e)
+        _cleanup_local()
         return []
 
     try:
@@ -133,3 +153,4 @@ def fetch_pixel_messages(since_ms: int = 0) -> list[dict]:
         return []
     finally:
         conn.close()
+        _cleanup_local()
