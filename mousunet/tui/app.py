@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -47,6 +48,7 @@ class MousuNetApp(App):
         Binding("g", "chat_top", "Top", show=False),
         Binding("G", "chat_bottom", "Bottom", show=False, key_display="shift+g"),
         Binding("question_mark", "show_help", "Help", show=False),
+        Binding("ctrl+g", "suggest_reply", "Suggest", show=False),
     ]
 
     def __init__(self) -> None:
@@ -58,6 +60,7 @@ class MousuNetApp(App):
         self._ingest_thread = None
         self._initial_select_done = False
         self._last_msg_count: int = 0
+        self._suggesting = False
 
     def compose(self) -> ComposeResult:
         yield HeaderBar()
@@ -336,6 +339,45 @@ class MousuNetApp(App):
             except Exception:
                 pass
 
+    # ── Claude suggestion ───────────────────────────────
+
+    def action_suggest_reply(self) -> None:
+        """Ctrl+G: generate a reply suggestion via Claude."""
+        if self._current_contact_id is None:
+            return
+        if self._suggesting:
+            return
+        chat = self.query_one(ChatView)
+        messages = chat.get_messages_text()
+        if not messages:
+            return
+        compose = self.query_one(ComposeBox)
+        compose.show_status("\u25c9 thinking...")
+        self._suggesting = True
+        contact_name = self._current_contact_name
+        threading.Thread(
+            target=self._run_suggest, args=(messages, contact_name), daemon=True
+        ).start()
+
+    def _run_suggest(self, messages: list, contact_name: str) -> None:
+        from ..suggest import suggest_reply
+        result = suggest_reply(messages, contact_name)
+        self.call_from_thread(self._on_suggest_done, result)
+
+    def _on_suggest_done(self, result: str) -> None:
+        self._suggesting = False
+        compose = self.query_one(ComposeBox)
+        if result.startswith("ERROR:"):
+            compose.show_status(f"\u25c9 {result}", error=True)
+            return
+        try:
+            inp = self.query_one("#compose-input", Input)
+            inp.value = result
+            inp.focus()
+        except Exception:
+            pass
+        compose.show_status("\u25c9 suggestion loaded — edit or hit Enter to send")
+
     def action_escape(self) -> None:
         # Close search if active
         conv_list = self.query_one(ConversationList)
@@ -411,6 +453,7 @@ class HelpScreen(ModalScreen):
                 "  [#50fa7b]?[/]           this help screen\n"
                 "\n"
                 "[#00d4ff bold]COMPOSE[/]\n"
+                "  [#50fa7b]ctrl+g[/]      suggest reply (Claude)\n"
                 "  [#50fa7b]Enter[/]       send message\n"
                 "  [#50fa7b]REPLY btn[/]   open full editor\n"
                 "  [#50fa7b]CLAUDE btn[/]  AI rewrite in editor\n"
