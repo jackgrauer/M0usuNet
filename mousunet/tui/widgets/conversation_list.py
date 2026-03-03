@@ -1,4 +1,4 @@
-"""Left panel — conversation list with DedSec styling."""
+"""Left panel — conversation list with search, vim nav, unread counts."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from textual.containers import VerticalScroll
 from textual.message import Message as TMessage
 from textual.reactive import reactive
 from textual.widget import Widget
-from textual.widgets import Static
+from textual.widgets import Input, Static
 
 from ...db.models import ConversationSummary
 
@@ -17,7 +17,36 @@ PLATFORM_STYLE = {
     "sms":      ("sms",  "#50fa7b"),
     "bumble":   ("bmbl", "#ff2d6f"),
     "hinge":    ("hnge", "#ff2d6f"),
+    "tinder":   ("tndr", "#ff8c00"),
 }
+
+
+class SearchBar(Widget):
+    """Inline search/filter bar for conversations."""
+
+    DEFAULT_CSS = """
+    SearchBar {
+        height: 1;
+        display: none;
+    }
+    SearchBar.--visible {
+        display: block;
+    }
+    SearchBar Input {
+        background: #111111;
+        color: #e0e0e0;
+        border: none;
+        width: 100%;
+        padding: 0;
+        height: 1;
+    }
+    SearchBar Input:focus {
+        border: none;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Input(placeholder="/ filter...", id="conv-search")
 
 
 class NewMessageButton(Static):
@@ -25,7 +54,7 @@ class NewMessageButton(Static):
 
     DEFAULT_CSS = """
     NewMessageButton {
-        height: 2;
+        height: 1;
         padding: 0 1;
         color: #00d4ff;
         text-style: bold;
@@ -38,7 +67,7 @@ class NewMessageButton(Static):
     """
 
     def __init__(self) -> None:
-        super().__init__("[ + NEW MESSAGE ]")
+        super().__init__("[ + NEW ]")
 
     def on_click(self) -> None:
         for ancestor in self.ancestors:
@@ -48,9 +77,9 @@ class NewMessageButton(Static):
 
 
 class ConversationList(VerticalScroll):
-    """Scrollable list of conversations."""
+    """Scrollable list of conversations with search and vim nav."""
 
-    BORDER_TITLE = "◈ NODES ◈"
+    BORDER_TITLE = "\u25c8 NODES \u25c8"
 
     class Selected(TMessage):
         """Fired when a conversation is selected."""
@@ -70,19 +99,53 @@ class ConversationList(VerticalScroll):
     def __init__(self) -> None:
         super().__init__()
         self._conversations: list[ConversationSummary] = []
+        self._filtered: list[ConversationSummary] = []
+        self._search_active = False
+        self._search_query = ""
         self.border_title = self.BORDER_TITLE
 
     def set_conversations(self, convos: list[ConversationSummary]) -> None:
         self._conversations = convos
+        self._apply_filter()
         self._render_list()
+
+    def _apply_filter(self) -> None:
+        if self._search_query:
+            q = self._search_query.lower()
+            self._filtered = [c for c in self._conversations if q in c.display_name.lower()]
+        else:
+            self._filtered = list(self._conversations)
+
+    @property
+    def _visible_conversations(self) -> list[ConversationSummary]:
+        return self._filtered
 
     def _render_list(self) -> None:
         self.remove_children()
+
+        # Search bar
+        search = SearchBar()
+        if self._search_active:
+            search.add_class("--visible")
+        self.mount(search)
         self.mount(NewMessageButton())
-        if not self._conversations:
-            self.mount(Static("no nodes online", classes="empty-state"))
+
+        convos = self._visible_conversations
+        if not convos:
+            if self._search_query:
+                self.mount(Static(f"[#555555]no matches for '{self._search_query}'[/]", classes="empty-state"))
+            else:
+                self.mount(Static("[#555555]no nodes online[/]", classes="empty-state"))
             return
-        for i, c in enumerate(self._conversations):
+
+        total = len(self._conversations)
+        showing = len(convos)
+        if self._search_query:
+            self.border_title = f"\u25c8 NODES ({showing}/{total}) \u25c8"
+        else:
+            self.border_title = f"\u25c8 NODES ({total}) \u25c8"
+
+        for i, c in enumerate(convos):
             item = ConversationItem(c, i)
             self.mount(item)
         self._highlight()
@@ -94,8 +157,9 @@ class ConversationList(VerticalScroll):
 
     def watch_selected_index(self) -> None:
         self._highlight()
-        if self._conversations and 0 <= self.selected_index < len(self._conversations):
-            c = self._conversations[self.selected_index]
+        convos = self._visible_conversations
+        if convos and 0 <= self.selected_index < len(convos):
+            c = convos[self.selected_index]
             self.post_message(self.Selected(c.contact_id, c.display_name, c.platform, c.phone or ""))
 
     def action_up(self) -> None:
@@ -103,18 +167,51 @@ class ConversationList(VerticalScroll):
             self.selected_index -= 1
 
     def action_down(self) -> None:
-        if self.selected_index < len(self._conversations) - 1:
+        if self.selected_index < len(self._visible_conversations) - 1:
             self.selected_index += 1
+
+    def toggle_search(self) -> None:
+        """Toggle search bar visibility."""
+        self._search_active = not self._search_active
+        if not self._search_active:
+            self._search_query = ""
+            self._apply_filter()
+            self._render_list()
+        else:
+            self._render_list()
+            try:
+                inp = self.query_one("#conv-search", Input)
+                inp.focus()
+            except Exception:
+                pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "conv-search":
+            self._search_query = event.value.strip()
+            old_idx = self.selected_index
+            self._apply_filter()
+            self._render_list()
+            # Reset selection to 0 when filter changes
+            if self.selected_index >= len(self._visible_conversations):
+                self.selected_index = 0
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "conv-search":
+            # Close search, keep filter active, focus list
+            self._search_active = False
+            self._render_list()
+            self.focus()
 
     @property
     def current(self) -> ConversationSummary | None:
-        if self._conversations and 0 <= self.selected_index < len(self._conversations):
-            return self._conversations[self.selected_index]
+        convos = self._visible_conversations
+        if convos and 0 <= self.selected_index < len(convos):
+            return convos[self.selected_index]
         return None
 
 
 class ConversationItem(Widget):
-    """A single conversation row with DedSec styling."""
+    """A single conversation row with platform badge and preview."""
 
     DEFAULT_CSS = """
     ConversationItem {
@@ -133,15 +230,28 @@ class ConversationItem(Widget):
 
     def compose(self) -> ComposeResult:
         c = self._convo
-        tag_label, tag_color = PLATFORM_STYLE.get(c.platform, (c.platform, "#555555"))
+        tag_label, tag_color = PLATFORM_STYLE.get(c.platform, (c.platform[:4], "#555555"))
 
-        name_line = f"{c.display_name}  [{tag_color}]\\[{tag_label}][/]"
+        # Timestamp
+        time_str = ""
+        if c.last_time:
+            today = __import__("datetime").date.today()
+            if c.last_time.date() == today:
+                time_str = c.last_time.strftime("%-I:%M%p").lower()
+            else:
+                time_str = c.last_time.strftime("%b %-d")
 
-        prefix = "you: " if c.direction == "out" else ""
-        preview = prefix + (c.last_message[:24] if c.last_message else "")
+        name_line = (
+            f"[{tag_color}]\\[{tag_label}][/] "
+            f"{c.display_name}"
+            f"  [#555555]{time_str}[/]"
+        )
+
+        prefix = "[#555555]you: [/]" if c.direction == "out" else ""
+        preview = c.last_message[:30] if c.last_message else ""
 
         yield Static(name_line, classes="conv-name")
-        yield Static(f"  [#555555]{preview}[/]", classes="conv-preview")
+        yield Static(f"     [#555555]{prefix}{preview}[/]", classes="conv-preview")
 
     def on_click(self) -> None:
         for ancestor in self.ancestors:

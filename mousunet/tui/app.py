@@ -36,9 +36,17 @@ class MousuNetApp(App):
     CSS_PATH = CSS_PATH
 
     BINDINGS = [
-        Binding("tab", "toggle_focus", "Toggle focus", show=False),
-        Binding("escape", "escape", "Escape", show=False),
+        Binding("tab", "toggle_focus", "Focus", show=False),
+        Binding("escape", "escape", "Esc", show=False),
+        Binding("slash", "search", "Search", show=False),
+        Binding("r", "focus_compose", "Reply", show=False),
+        Binding("n", "new_message", "New", show=False),
         Binding("d", "delete_conversation", "Delete", show=False),
+        Binding("j", "nav_down", "Down", show=False),
+        Binding("k", "nav_up", "Up", show=False),
+        Binding("g", "chat_top", "Top", show=False),
+        Binding("G", "chat_bottom", "Bottom", show=False, key_display="shift+g"),
+        Binding("question_mark", "show_help", "Help", show=False),
     ]
 
     def __init__(self) -> None:
@@ -46,8 +54,10 @@ class MousuNetApp(App):
         self._current_contact_id: int | None = None
         self._current_contact_name: str = ""
         self._current_platform: str = ""
+        self._current_phone: str = ""
         self._ingest_thread = None
         self._initial_select_done = False
+        self._last_msg_count: int = 0
 
     def compose(self) -> ComposeResult:
         yield HeaderBar()
@@ -69,7 +79,6 @@ class MousuNetApp(App):
     def _refresh_conversations(self) -> None:
         with get_connection() as conn:
             convos = conversation_list(conn)
-            # Check if active chat has new messages
             current_msg_count = 0
             if self._current_contact_id is not None:
                 row = conn.execute(
@@ -80,7 +89,7 @@ class MousuNetApp(App):
 
         # Reload active chat if message count changed
         if self._current_contact_id is not None:
-            prev = getattr(self, "_last_msg_count", 0)
+            prev = self._last_msg_count
             if current_msg_count != prev:
                 self._last_msg_count = current_msg_count
                 self._load_chat()
@@ -107,7 +116,7 @@ class MousuNetApp(App):
         self._current_contact_name = event.display_name
         self._current_platform = event.platform
         self._current_phone = event.phone
-        self._last_msg_count = 0  # reset so _load_chat runs fresh
+        self._last_msg_count = 0
         self._load_chat()
         compose = self.query_one(ComposeBox)
         compose.set_contact_name(event.display_name)
@@ -121,8 +130,60 @@ class MousuNetApp(App):
         chat = self.query_one(ChatView)
         chat.set_messages(
             msgs, self._current_contact_name, self._current_platform,
-            phone=getattr(self, "_current_phone", ""),
+            phone=self._current_phone,
         )
+
+    # ── Navigation ─────────────────────────────────────────
+
+    def _in_text_input(self) -> bool:
+        """True if focus is in a text input (don't intercept single-key bindings)."""
+        focused = self.focused
+        if focused is None:
+            return False
+        return isinstance(focused, Input) or (hasattr(focused, '__class__') and focused.__class__.__name__ == 'TextArea')
+
+    def action_nav_down(self) -> None:
+        if self._in_text_input():
+            return
+        self.query_one(ConversationList).action_down()
+
+    def action_nav_up(self) -> None:
+        if self._in_text_input():
+            return
+        self.query_one(ConversationList).action_up()
+
+    def action_chat_top(self) -> None:
+        if self._in_text_input():
+            return
+        self.query_one(ChatView).scroll_home(animate=False)
+
+    def action_chat_bottom(self) -> None:
+        if self._in_text_input():
+            return
+        self.query_one(ChatView).scroll_end(animate=False)
+
+    def action_search(self) -> None:
+        if self._in_text_input():
+            return
+        self.query_one(ConversationList).toggle_search()
+
+    def action_focus_compose(self) -> None:
+        if self._in_text_input():
+            return
+        try:
+            self.query_one("#compose-input", Input).focus()
+        except Exception:
+            pass
+
+    def action_new_message(self) -> None:
+        if self._in_text_input():
+            return
+        self.on_conversation_list_new_message_requested()
+
+    def action_show_help(self) -> None:
+        if self._in_text_input():
+            return
+        self.push_screen(HelpScreen())
 
     # ── New Message modal ──────────────────────────────────
 
@@ -132,16 +193,13 @@ class MousuNetApp(App):
     def _on_new_message_done(self, contact_id: int | None) -> None:
         if contact_id is None:
             return
-        # Refresh sidebar so new/existing contact appears
-        self._last_conv_ids = None  # force rebuild
+        self._last_conv_ids = None
         self._refresh_conversations()
-        # Try to select the contact in the sidebar
         conv_list = self.query_one(ConversationList)
-        for i, c in enumerate(conv_list._conversations):
+        for i, c in enumerate(conv_list._visible_conversations):
             if c.contact_id == contact_id:
                 conv_list.selected_index = i
                 return
-        # Contact exists but has no messages yet — load empty chat directly
         with get_connection() as conn:
             contact = get_contact(conn, contact_id)
         if contact:
@@ -159,6 +217,8 @@ class MousuNetApp(App):
     # ── Delete Conversation modal ─────────────────────────
 
     def action_delete_conversation(self) -> None:
+        if self._in_text_input():
+            return
         if self._current_contact_id is None:
             return
         with get_connection() as conn:
@@ -182,7 +242,7 @@ class MousuNetApp(App):
         self._current_platform = ""
         self._current_phone = ""
         self._last_msg_count = 0
-        self._last_conv_ids = None  # force sidebar rebuild
+        self._last_conv_ids = None
         self._refresh_conversations()
         chat = self.query_one(ChatView)
         chat.set_messages([], "", "")
@@ -190,7 +250,6 @@ class MousuNetApp(App):
     # ── Tab styling helper ────────────────────────────────
 
     def _update_tabs(self, active: str) -> None:
-        """Toggle --active class on the main HeaderBar's tab buttons."""
         header = self.query_one(HeaderBar)
         for tab_id in ("tab-messages", "tab-editor"):
             try:
@@ -207,38 +266,30 @@ class MousuNetApp(App):
         self._send_body(event.body)
 
     def action_reply_editor(self) -> None:
-        """Open reply editor screen with message context."""
-        # Don't stack multiple editor screens
         if isinstance(self.screen, ReplyEditorScreen):
             return
         if self._current_contact_id is None:
             return
-
         chat = self.query_one(ChatView)
         contact_name = self._current_contact_name
-
         context_lines = []
         for direction, sender, body in chat.get_messages_text()[-10:]:
             context_lines.append(f"{sender}: {body}")
-
         screen = ReplyEditorScreen(context_lines, contact_name)
         self.push_screen(screen, callback=self._on_reply_editor_done)
         self._update_tabs("editor")
 
     def action_show_messages(self) -> None:
-        """Pop back to the main messages screen."""
         if isinstance(self.screen, ReplyEditorScreen):
             self.screen.dismiss("")
         self._update_tabs("messages")
 
     def _on_reply_editor_done(self, result: str) -> None:
-        """Called when reply editor screen is dismissed."""
         self._update_tabs("messages")
         if result:
             self._send_body(result)
 
     def _send_body(self, body: str) -> None:
-        """Send a message body to the current contact."""
         if self._current_contact_id is None:
             return
         contact_name = self._current_contact_name
@@ -271,12 +322,11 @@ class MousuNetApp(App):
         chat.append_message(msg)
 
         if success:
-            compose.show_status(f"◉ RELAY OK  {output}")
+            compose.show_status(f"\u25c9 RELAY OK  {output}")
         else:
-            compose.show_status(f"◉ RELAY FAIL  {output}", error=True)
+            compose.show_status(f"\u25c9 RELAY FAIL  {output}", error=True)
 
     def action_toggle_focus(self) -> None:
-        """Toggle focus between compose input and conversation list."""
         focused = self.focused
         if focused and focused.id == "compose-input":
             self.query_one(ConversationList).focus()
@@ -287,10 +337,87 @@ class MousuNetApp(App):
                 pass
 
     def action_escape(self) -> None:
-        """Clear compose input and refocus sidebar."""
+        # Close search if active
+        conv_list = self.query_one(ConversationList)
+        if conv_list._search_active:
+            conv_list.toggle_search()
+            conv_list.focus()
+            return
         try:
             inp = self.query_one("#compose-input", Input)
             inp.value = ""
         except Exception:
             pass
-        self.query_one(ConversationList).focus()
+        conv_list.focus()
+
+
+# ── Help overlay ──────────────────────────────────────────
+
+from textual.screen import ModalScreen
+from textual.containers import Vertical
+
+
+class HelpScreen(ModalScreen):
+    """Keybinding reference overlay."""
+
+    DEFAULT_CSS = """
+    HelpScreen {
+        align: center middle;
+    }
+    #help-box {
+        width: 56;
+        height: auto;
+        max-height: 80%;
+        background: #0d0d0d;
+        border: heavy #00d4ff;
+        padding: 1 2;
+    }
+    #help-title {
+        color: #00d4ff;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #help-body {
+        color: #e0e0e0;
+    }
+    #help-hint {
+        color: #555555;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "dismiss", "Close"),
+        ("question_mark", "dismiss", "Close"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="help-box"):
+            yield Static("\u25c8 KEYBINDINGS \u25c8", id="help-title")
+            yield Static(
+                "[#00d4ff bold]NAVIGATION[/]\n"
+                "  [#50fa7b]j / k[/]       move down / up in sidebar\n"
+                "  [#50fa7b]g / G[/]       scroll chat to top / bottom\n"
+                "  [#50fa7b]Tab[/]         toggle focus: sidebar <-> compose\n"
+                "  [#50fa7b]Esc[/]         close search / clear compose\n"
+                "\n"
+                "[#00d4ff bold]ACTIONS[/]\n"
+                "  [#50fa7b]r[/]           focus compose box (quick reply)\n"
+                "  [#50fa7b]n[/]           new message\n"
+                "  [#50fa7b]d[/]           delete conversation\n"
+                "  [#50fa7b]/[/]           search/filter conversations\n"
+                "  [#50fa7b]?[/]           this help screen\n"
+                "\n"
+                "[#00d4ff bold]COMPOSE[/]\n"
+                "  [#50fa7b]Enter[/]       send message\n"
+                "  [#50fa7b]REPLY btn[/]   open full editor\n"
+                "  [#50fa7b]CLAUDE btn[/]  AI rewrite in editor\n"
+                "\n"
+                "[#00d4ff bold]CHAT[/]\n"
+                "  [#50fa7b]click msg[/]   copy to clipboard\n"
+                "  [#50fa7b]Home/End[/]    scroll to top/bottom\n",
+                id="help-body",
+            )
+            yield Static("press [#00d4ff]?[/] or [#00d4ff]Esc[/] to close", id="help-hint")

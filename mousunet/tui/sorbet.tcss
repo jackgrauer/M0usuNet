@@ -1,4 +1,4 @@
-/* DedSec theme for MousuNet */
+/* DedSec theme for MousuNet — v2 */
 
 Screen {
     background: #0a0a0a;
@@ -22,13 +22,10 @@ HeaderBar Horizontal {
 }
 
 HeaderBar #app-title {
-    color: #00d4ff;
-    text-style: bold;
     width: auto;
 }
 
 HeaderBar #clock {
-    color: #555555;
     width: auto;
     dock: right;
 }
@@ -64,7 +61,12 @@ HeaderBar #mesh-status {
     color: #e0e0e0;
     width: auto;
     content-align: center middle;
-    margin: 0 2;
+    margin: 0 1;
+}
+
+HeaderBar #ingest-status {
+    width: auto;
+    margin: 0 1;
 }
 
 /* ── Left panel: conversation list ── */
@@ -103,11 +105,27 @@ ConversationItem.--highlight {
 
 /* ── Right panel: chat view ── */
 
-
-
 ChatView {
     padding: 0 1;
     background: #0a0a0a;
+}
+
+/* Message bubbles */
+
+MessageBubble {
+    height: auto;
+    padding: 0 0;
+    margin: 0 0;
+}
+
+MessageBubble.msg-out {
+    text-align: right;
+    padding: 0 0 0 8;
+}
+
+MessageBubble.msg-in {
+    text-align: left;
+    padding: 0 8 0 0;
 }
 
 /* ── Bottom: compose box ── */
@@ -127,10 +145,11 @@ ChatView {
 
 ComposeBox {
     height: auto;
-    max-height: 2;
+    max-height: 3;
     dock: bottom;
     padding: 0;
     background: #0d0d0d;
+    border-top: heavy #1a5c7a;
 }
 
 ComposeBox Horizontal {
@@ -149,10 +168,16 @@ ComposeBox Input {
     color: #e0e0e0;
     border: none;
     width: 1fr;
+    padding: 0;
 }
 
 ComposeBox Input:focus {
     border: none;
+    color: #e0e0e0;
+}
+
+ComposeBox Input.-placeholder {
+    color: #555555;
 }
 
 #relay-status {
