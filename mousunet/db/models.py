@@ -11,6 +11,7 @@ class Contact(BaseModel):
     display_name: str
     phone: Optional[str] = None
     created_at: Optional[datetime] = None
+    last_viewed_at: Optional[datetime] = None
 
 
 class Message(BaseModel):
@@ -33,3 +34,4 @@ class ConversationSummary(BaseModel):
     last_message: str
     last_time: Optional[datetime] = None
     direction: str
+    unread_count: int = 0

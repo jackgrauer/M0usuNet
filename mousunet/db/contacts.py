@@ -71,3 +71,12 @@ def import_tsv(path: Path) -> int:
             upsert_contact(conn, name, phone)
             count += 1
     return count
+
+
+def mark_viewed(conn: sqlite3.Connection, contact_id: int) -> None:
+    """Update last_viewed_at to now for a contact."""
+    conn.execute(
+        "UPDATE contacts SET last_viewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (contact_id,),
+    )
+    conn.commit()

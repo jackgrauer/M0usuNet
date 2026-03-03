@@ -53,4 +53,7 @@ MIGRATIONS: list[tuple[int, str]] = [
         CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_external_guid
             ON messages(external_guid) WHERE external_guid IS NOT NULL;
     """),
+    (3, """
+        ALTER TABLE contacts ADD COLUMN last_viewed_at TIMESTAMP;
+    """),
 ]

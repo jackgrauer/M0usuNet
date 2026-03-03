@@ -86,7 +86,11 @@ def conversation_list(conn: sqlite3.Connection) -> list[ConversationSummary]:
             m.platform,
             m.body AS last_message,
             m.sent_at AS last_time,
-            m.direction
+            m.direction,
+            (SELECT COUNT(*) FROM messages
+             WHERE contact_id = c.id AND direction = 'in'
+             AND sent_at > COALESCE(c.last_viewed_at, '1970-01-01')
+            ) AS unread_count
         FROM contacts c
         JOIN messages m ON m.id = (
             SELECT id FROM messages

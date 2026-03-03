@@ -11,7 +11,7 @@ from textual.binding import Binding
 from textual.widgets import Input
 
 from ..db.connection import ensure_schema, get_connection
-from ..db.contacts import get_contact
+from ..db.contacts import get_contact, mark_viewed
 from ..db.messages import (
     add_message, conversation_list, delete_messages_for_contact, get_messages,
 )
@@ -121,6 +121,9 @@ class MousuNetApp(App):
         self._current_phone = event.phone
         self._last_msg_count = 0
         self._load_chat()
+        # Mark conversation as read
+        with get_connection() as conn:
+            mark_viewed(conn, event.contact_id)
         compose = self.query_one(ComposeBox)
         compose.set_contact_name(event.display_name)
         compose.clear_status()

@@ -241,9 +241,14 @@ class ConversationItem(Widget):
             else:
                 time_str = c.last_time.strftime("%b %-d")
 
+        # Unread badge
+        unread = ""
+        if c.unread_count > 0:
+            unread = f" [bold #00d4ff]({c.unread_count})[/]"
+
         name_line = (
             f"[{tag_color}]\\[{tag_label}][/] "
-            f"{c.display_name}"
+            f"{c.display_name}{unread}"
             f"  [#555555]{time_str}[/]"
         )
 
