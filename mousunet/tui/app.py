@@ -415,8 +415,11 @@ class HelpScreen(ModalScreen):
                 "  [#50fa7b]REPLY btn[/]   open full editor\n"
                 "  [#50fa7b]CLAUDE btn[/]  AI rewrite in editor\n"
                 "\n"
-                "[#00d4ff bold]CHAT[/]\n"
-                "  [#50fa7b]click msg[/]   copy to clipboard\n"
+                "[#00d4ff bold]CHAT (read-only TextArea)[/]\n"
+                "  [#50fa7b]click+drag[/]  select text\n"
+                "  [#50fa7b]shift+arrows[/] select with keyboard\n"
+                "  [#50fa7b]ctrl+c[/]      copy selection\n"
+                "  [#50fa7b]ctrl+a[/]      select all\n"
                 "  [#50fa7b]Home/End[/]    scroll to top/bottom\n",
                 id="help-body",
             )
