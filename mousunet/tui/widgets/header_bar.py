@@ -30,19 +30,20 @@ class TabButton(Static):
 
 
 class HeaderBar(Widget):
-    """Top bar with app title, time, mesh status, and ingest health."""
+    """Top bar with app title, tabs, mesh status, and ingest health."""
 
     def __init__(self) -> None:
         super().__init__()
         self._device_status: dict[str, bool] = {name: False for name in MESH_DEVICES}
         self._pinging = False
-        self._ingest_ok = True
 
     def compose(self) -> ComposeResult:
         with Horizontal():
-            yield Static("[#00d4ff bold]M0usu[/][#50fa7b bold]Net[/]", id="app-title")
-            yield TabButton(" MSG ", id="tab-messages", classes="tab-btn --active")
-            yield TabButton(" EDIT ", id="tab-editor", classes="tab-btn")
+            yield Static(" m0usunet ", id="app-title")
+            yield Static(" ", id="title-spacer")
+            yield TabButton(" MESSAGES ", id="tab-messages", classes="tab-btn --active")
+            yield TabButton(" COMPOSE ", id="tab-editor", classes="tab-btn")
+            yield Static("", id="spacer", classes="header-spacer")
             yield Static("", id="ingest-status")
             yield Static("", id="mesh-status")
             yield Static("", id="clock")
@@ -63,7 +64,6 @@ class HeaderBar(Widget):
             pass
 
     def _check_ingest(self) -> None:
-        """Check if ingest daemon service is running."""
         threading.Thread(target=self._do_check_ingest, daemon=True).start()
 
     def _do_check_ingest(self) -> None:
@@ -116,7 +116,7 @@ class HeaderBar(Widget):
                 parts.append(f"[#50fa7b]\u25c9 {label}[/]")
             else:
                 parts.append(f"[#f75341]\u25cb {label}[/]")
-        text = "  ".join(parts)
+        text = " ".join(parts)
         try:
             self.query_one("#mesh-status", Static).update(text)
         except Exception:

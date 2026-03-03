@@ -1,4 +1,4 @@
-/* DedSec theme for MousuNet — v3 */
+/* m0usunet theme — v4 */
 
 Screen {
     background: #0a0a0a;
@@ -23,11 +23,20 @@ HeaderBar Horizontal {
 
 HeaderBar #app-title {
     width: auto;
+    color: #00d4ff;
+    text-style: bold;
+}
+
+HeaderBar #title-spacer {
+    width: 1;
+}
+
+HeaderBar .header-spacer {
+    width: 1fr;
 }
 
 HeaderBar #clock {
     width: auto;
-    dock: right;
 }
 
 .tab-btn {
@@ -35,7 +44,7 @@ HeaderBar #clock {
     height: 1;
     background: #1a1a1a;
     color: #555555;
-    margin: 0 0 0 1;
+    margin: 0 1 0 0;
 }
 
 .tab-btn:hover {
@@ -57,16 +66,15 @@ HeaderBar #clock {
     color: #00d4ff;
 }
 
+HeaderBar #ingest-status {
+    width: auto;
+    margin: 0 1 0 0;
+}
+
 HeaderBar #mesh-status {
     color: #e0e0e0;
     width: auto;
-    content-align: center middle;
-    margin: 0 1;
-}
-
-HeaderBar #ingest-status {
-    width: auto;
-    margin: 0 1;
+    margin: 0 1 0 0;
 }
 
 /* ── Left panel: conversation list ── */
