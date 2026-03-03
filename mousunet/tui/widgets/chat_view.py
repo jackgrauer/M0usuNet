@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 
 from rich.style import Style
 from textual.app import ComposeResult
@@ -43,6 +43,14 @@ _CHAT_THEME = TextAreaTheme(
 _MSG_RE = re.compile(r"^(\s*\d+:\d+[ap]m)\s{2}(\S+):\s(.*)$")
 
 
+def _to_local(dt: datetime) -> datetime:
+    """Convert a datetime to local time. Handles both aware and naive datetimes."""
+    if dt.tzinfo is not None:
+        return dt.astimezone()
+    # Naive datetime — assume it's already local
+    return dt
+
+
 def _date_label(d: date) -> str:
     today = date.today()
     delta = (today - d).days
@@ -61,7 +69,15 @@ def _date_label(d: date) -> str:
 def _format_time(dt: datetime | None) -> str:
     if not dt:
         return "     "
-    return dt.strftime("%-I:%M%p").lower().rjust(7)
+    local_dt = _to_local(dt)
+    return local_dt.strftime("%-I:%M%p").lower().rjust(7)
+
+
+def _local_date(dt: datetime | None) -> date | None:
+    """Get the local date for a datetime (converting from UTC if needed)."""
+    if not dt:
+        return None
+    return _to_local(dt).date()
 
 
 def _render_message(msg: Message, contact_name: str) -> str:
@@ -184,15 +200,14 @@ class ChatView(Vertical):
             sender = "you" if msg.direction == "out" else contact_name
             self._messages_data.append((msg.direction, sender, msg.body))
 
-            if msg.sent_at:
-                msg_date = msg.sent_at.date()
-                if msg_date != last_date:
-                    if lines:
-                        lines.append("")
-                    sep = _date_label(msg_date)
-                    lines.append(f"─── {sep} ───")
+            msg_date = _local_date(msg.sent_at)
+            if msg_date and msg_date != last_date:
+                if lines:
                     lines.append("")
-                    last_date = msg_date
+                sep = _date_label(msg_date)
+                lines.append(f"─── {sep} ───")
+                lines.append("")
+                last_date = msg_date
 
             line_dirs[len(lines)] = msg.direction
             lines.append(_render_message(msg, contact_name))
@@ -251,12 +266,13 @@ class ChatView(Vertical):
 
             # Check if we need a date separator
             new_line = ""
-            if msg.sent_at:
-                msg_date = msg.sent_at.date()
+            msg_date = _local_date(msg.sent_at)
+            if msg_date:
                 last_date = None
                 for m in reversed(self._raw_messages[:-1]):
-                    if m.sent_at:
-                        last_date = m.sent_at.date()
+                    ld = _local_date(m.sent_at)
+                    if ld:
+                        last_date = ld
                         break
                 if last_date and msg_date != last_date:
                     sep = _date_label(msg_date)

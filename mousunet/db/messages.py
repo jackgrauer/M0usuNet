@@ -34,12 +34,35 @@ def add_message_with_guid(
     external_guid: str | None = None,
     delivered: bool = True,
 ) -> bool:
-    """Insert a message with external_guid dedup. Returns True if inserted, False if duplicate."""
+    """Insert a message with dedup. Returns True if inserted, False if duplicate."""
+    # Exact guid dedup
     if external_guid:
         existing = conn.execute(
             "SELECT 1 FROM messages WHERE external_guid = ?", (external_guid,)
         ).fetchone()
         if existing:
+            return False
+
+    # Fuzzy dedup for outbound messages: relay records the sent message, then
+    # Pixel/iPad ingest finds the same message later. Match on first 50 chars
+    # of body + same contact + within 2 minutes.
+    if direction == "out" and sent_at:
+        prefix = body[:50]
+        fuzzy = conn.execute(
+            "SELECT id FROM messages "
+            "WHERE contact_id = ? AND direction = 'out' "
+            "AND SUBSTR(body, 1, 50) = ? "
+            "AND ABS(CAST((julianday(sent_at) - julianday(?)) * 86400 AS INTEGER)) < 120",
+            (contact_id, prefix, sent_at),
+        ).fetchone()
+        if fuzzy:
+            # Stamp the existing message with the ingest guid so future polls skip it
+            if external_guid:
+                conn.execute(
+                    "UPDATE messages SET external_guid = ? WHERE id = ? AND external_guid IS NULL",
+                    (external_guid, fuzzy["id"]),
+                )
+                conn.commit()
             return False
 
     if sent_at:
