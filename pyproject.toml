@@ -3,14 +3,14 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mousunet"
+name = "m0usunet"
 version = "0.1.0"
 description = "Unified messaging TUI"
 requires-python = ">=3.11"
 dependencies = [
-    "textual>=0.89",
+    "textual>=0.89,<1.0",  # pinned: chat highlights use private internals
     "pydantic>=2.0",
 ]
 
 [project.scripts]
-M0usuNet = "mousunet.cli:main"
+M0usuNet = "m0usunet.cli:main"

@@ -1,7 +1,7 @@
 #!/bin/sh
 # If passing args (like "ingest"), run directly without tmux
 if [ $# -gt 0 ]; then
-    exec ~/m0usunet/.venv/bin/python3 -m mousunet "$@"
+    exec ~/m0usunet/.venv/bin/python3 -m m0usunet "$@"
 fi
 
 # For the TUI: attach to existing tmux session or create one
@@ -9,5 +9,5 @@ SESSION="m0usunet"
 if tmux has-session -t "$SESSION" 2>/dev/null; then
     exec tmux attach-session -t "$SESSION"
 else
-    exec tmux new-session -s "$SESSION" ~/m0usunet/.venv/bin/python3 -m mousunet
+    exec tmux new-session -s "$SESSION" ~/m0usunet/.venv/bin/python3 -m m0usunet
 fi
