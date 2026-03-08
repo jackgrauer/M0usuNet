@@ -151,6 +151,24 @@ ChatView {
     background: #50fa7b;
 }
 
+#attach-btn {
+    width: auto;
+    height: 1;
+    background: #2a1a00;
+    color: #ff8c00;
+    text-style: bold;
+}
+
+#attach-btn:hover {
+    color: #0a0a0a;
+    background: #ff8c00;
+}
+
+#attach-indicator {
+    height: 1;
+    color: #ff8c00;
+}
+
 ComposeBox {
     height: auto;
     max-height: 3;
@@ -182,6 +200,14 @@ ComposeBox Input {
 ComposeBox Input:focus {
     border: none;
     color: #e0e0e0;
+}
+
+ComposeBox Input.--over-limit {
+    color: #f75341;
+}
+
+ComposeBox Input.--over-limit:focus {
+    color: #f75341;
 }
 
 ComposeBox Input.-placeholder {

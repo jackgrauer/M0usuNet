@@ -21,7 +21,7 @@ from textual.message import Message as TMessage
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widget import Widget
-from textual.widgets import Input, OptionList, Static, TextArea
+from textual.widgets import DirectoryTree, Input, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 from textual.widgets.text_area import TextAreaTheme
 
@@ -137,8 +137,8 @@ class TabButton(Static):
         event.stop()
         if self.id == "tab-messages":
             self.app.action_show_messages()
-        elif self.id == "tab-editor":
-            self.app.action_reply_editor()
+        elif self.id == "tab-compose":
+            self.app.action_new_message()
 
 
 class HeaderBar(Widget):
@@ -154,7 +154,7 @@ class HeaderBar(Widget):
             yield Static(" m0usunet ", id="app-title")
             yield Static(" ", id="title-spacer")
             yield TabButton(" MESSAGES ", id="tab-messages", classes="tab-btn --active")
-            yield TabButton(" COMPOSE ", id="tab-editor", classes="tab-btn")
+            yield TabButton(" COMPOSE ", id="tab-compose", classes="tab-btn")
             yield Static("", id="spacer", classes="header-spacer")
             yield Static("", id="unread-count")
             yield Static("", id="ingest-status")
@@ -246,34 +246,96 @@ class HeaderBar(Widget):
 # ── Compose box ───────────────────────────────────────────
 
 class ReplyButton(Static):
-    """Clickable button that opens the reply editor."""
+    """Clickable button that toggles the compose input."""
 
     def on_click(self, event) -> None:
         event.stop()
-        self.app.action_reply_editor()
+        for ancestor in self.ancestors:
+            if isinstance(ancestor, ComposeBox):
+                ancestor.show_input()
+                break
+
+
+class AttachButton(Static):
+    """Clickable button that opens the file picker."""
+
+    def on_click(self, event) -> None:
+        event.stop()
+        self.app.action_attach_file()
 
 
 class ComposeBox(Widget):
     """Reply input that fires a Submitted message."""
 
+    WORD_LIMIT = 18
+
     class Submitted(TMessage):
         """User pressed Enter with a message."""
 
-        def __init__(self, body: str) -> None:
+        def __init__(self, body: str, attachment_path: str = "") -> None:
             super().__init__()
             self.body = body
+            self.attachment_path = attachment_path
 
     def __init__(self) -> None:
         super().__init__()
         self._placeholder = "select a node..."
         self._status = Static("", id="relay-status")
+        self._input_visible = False
+        self._attachment_path: str = ""
 
     def compose(self) -> ComposeResult:
         with Horizontal():
             yield ReplyButton(" REPLY ", id="reply-btn")
+            yield AttachButton(" ATTACH ", id="attach-btn")
             yield Static(" \u25b8 ", id="compose-prompt")
             yield Input(placeholder=self._placeholder, id="compose-input")
+        yield Static("", id="attach-indicator")
         yield self._status
+
+    def on_mount(self) -> None:
+        self._hide_input()
+        try:
+            self.query_one("#attach-indicator", Static).display = False
+        except Exception:
+            pass
+
+    def _hide_input(self) -> None:
+        self._input_visible = False
+        try:
+            self.query_one("#compose-prompt", Static).display = False
+            self.query_one("#compose-input", Input).display = False
+        except Exception:
+            pass
+
+    def show_input(self) -> None:
+        self._input_visible = True
+        try:
+            self.query_one("#compose-prompt", Static).display = True
+            inp = self.query_one("#compose-input", Input)
+            inp.display = True
+            inp.focus()
+        except Exception:
+            pass
+
+    def set_attachment(self, path: str) -> None:
+        self._attachment_path = path
+        filename = path.rsplit("/", 1)[-1]
+        try:
+            indicator = self.query_one("#attach-indicator", Static)
+            indicator.update(f"  [#ff8c00]+ {filename}[/]")
+            indicator.display = True
+        except Exception:
+            pass
+
+    def clear_attachment(self) -> None:
+        self._attachment_path = ""
+        try:
+            self.query_one("#attach-indicator", Static).display = False
+            self.query_one("#attach-indicator", Static).update("")
+            self.query_one("#attach-input", Input).value = ""
+        except Exception:
+            pass
 
     def set_contact_name(self, name: str) -> None:
         self._placeholder = f"message {name}..."
@@ -291,12 +353,23 @@ class ComposeBox(Widget):
     def clear_status(self) -> None:
         self._status.update("")
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "compose-input":
+            words = len(event.value.split()) if event.value.strip() else 0
+            event.input.set_class(words > self.WORD_LIMIT, "--over-limit")
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "compose-input":
+            return
         body = event.value.strip()
-        if not body:
+        if not body and not self._attachment_path:
             return
         event.input.value = ""
-        self.post_message(self.Submitted(body))
+        event.input.remove_class("--over-limit")
+        att_path = self._attachment_path
+        self.clear_attachment()
+        self._hide_input()
+        self.post_message(self.Submitted(body or "[attachment]", att_path))
 
 
 # ── Conversation list ─────────────────────────────────────
@@ -524,7 +597,6 @@ class ConversationList(VerticalScroll):
         if self._search_active:
             search.add_class("--visible")
         self.mount(search)
-        self.mount(NewMessageButton())
 
         if not convos:
             if self._search_query:
@@ -630,7 +702,7 @@ _CHAT_THEME = TextAreaTheme(
     },
 )
 
-_MSG_RE = re.compile(r"^(\s*\d+:\d+[ap]m)\s{2}(\S+):\s(.*)$")
+_MSG_RE = re.compile(r"^(\s*\d+:\d+[ap]m)\s{2}(.+?):\s(.*)$")
 
 
 def _to_local(dt: datetime) -> datetime:
@@ -713,15 +785,14 @@ def _apply_highlights(area: TextArea, line_directions: dict[int, str]) -> None:
     for i, line in enumerate(lines):
         if line.startswith("\u2500\u2500\u2500"):
             token = "scheduled" if "SCHEDULED" in line else "separator"
-            highlights[i].append((0, len(line), token))
+            highlights[i].append((0, None, token))
             continue
 
-        if line.lstrip().startswith("[") and line.lstrip().endswith("]") and "  [" in line:
-            highlights[i].append((0, len(line), "attachment"))
-            continue
-
-        if line.strip().startswith("[") and line.strip().endswith("]"):
-            highlights[i].append((0, len(line), "scheduled"))
+        if line.lstrip().startswith("[") and line.lstrip().endswith("]"):
+            if "  [" in line:
+                highlights[i].append((0, None, "attachment"))
+            else:
+                highlights[i].append((0, None, "scheduled"))
             continue
 
         if not line.strip():
@@ -731,31 +802,11 @@ def _apply_highlights(area: TextArea, line_directions: dict[int, str]) -> None:
         if direction is None:
             continue
 
-        m = _MSG_RE.match(line)
-        if not m:
-            token = "sent" if direction == "out" else "received"
-            highlights[i].append((0, len(line), token))
-            continue
-
-        ts_text, sender_text, body_text = m.group(1), m.group(2), m.group(3)
-        ts_end = m.start(1) + len(ts_text)
-        sender_start = m.start(2)
-        sender_end = sender_start + len(sender_text) + 1
-        body_start = m.start(3)
-        body_end = body_start + len(body_text)
-
+        # Color the whole line based on direction
         if direction == "out":
-            highlights[i].append((0, ts_end, "timestamp"))
-            highlights[i].append((sender_start, sender_end, "sent.name"))
-            highlights[i].append((sender_end + 1, None, "sent"))
-            if body_text.endswith(" \u2713"):
-                highlights[i].append((body_end - 1, body_end, "delivery.ok"))
-            elif body_text.endswith(" \u2717"):
-                highlights[i].append((body_end - 1, body_end, "delivery.fail"))
+            highlights[i].append((0, None, "sent"))
         else:
-            highlights[i].append((0, ts_end, "timestamp"))
-            highlights[i].append((sender_start, sender_end, "received.name"))
-            highlights[i].append((sender_end + 1, None, "received"))
+            highlights[i].append((0, None, "received"))
 
     # These are private Textual internals — wrap so chat still works
     # (just unstyled) if Textual changes them.
@@ -802,6 +853,7 @@ class ChatView(Vertical):
         self._update_title()
         self._messages_data = []
         self._line_directions = {}
+        self._line_attachments: dict[int, Attachment] = {}
 
         if not messages and not contact_id:
             self._set_text("  no transmissions yet", {})
@@ -819,6 +871,7 @@ class ChatView(Vertical):
 
         lines: list[str] = []
         line_dirs: dict[int, str] = {}
+        line_atts: dict[int, Attachment] = {}
         last_date = None
 
         for msg in messages:
@@ -834,10 +887,15 @@ class ChatView(Vertical):
                 lines.append("")
                 last_date = msg_date
 
-            msg_lines = _render_message(msg, contact_name, att_map.get(msg.id))
+            msg_atts = att_map.get(msg.id, [])
+            msg_lines = _render_message(msg, contact_name, msg_atts or None)
             line_dirs[len(lines)] = msg.direction
             lines.append(msg_lines[0])
+            att_idx = 0
             for extra in msg_lines[1:]:
+                if att_idx < len(msg_atts):
+                    line_atts[len(lines)] = msg_atts[att_idx]
+                    att_idx += 1
                 lines.append(extra)
 
         # Show pending scheduled messages
@@ -858,6 +916,7 @@ class ChatView(Vertical):
             return
 
         self._line_directions = line_dirs
+        self._line_attachments = line_atts
         self._set_text("\n".join(lines), line_dirs)
 
     def _set_text(self, text: str, line_dirs: dict[int, str]) -> None:
@@ -877,6 +936,21 @@ class ChatView(Vertical):
             area.move_cursor((area.document.line_count - 1, 0))
         except Exception:
             pass
+
+    def get_cursor_attachment(self) -> Attachment | None:
+        """Return the Attachment on the current cursor line, if any."""
+        try:
+            area = self.query_one("#chat-area", TextArea)
+            row = area.cursor_location[0]
+            return self._line_attachments.get(row)
+        except Exception:
+            return None
+
+    def on_click(self, event) -> None:
+        """Open attachment when an attachment line is clicked."""
+        att = self.get_cursor_attachment()
+        if att:
+            self.app.action_view_attachment()
 
     @staticmethod
     def _fmt_duration(seconds: float) -> str:
@@ -1139,6 +1213,63 @@ class _CtxOption(Static):
 # ── New message screen ────────────────────────────────────
 
 _PHONE_RE = re.compile(r"^\+?\d[\d\s\-]{6,}$")
+
+
+class FilePickerScreen(ModalScreen[str | None]):
+    """File browser for selecting attachments."""
+
+    DEFAULT_CSS = """
+    FilePickerScreen {
+        align: center middle;
+    }
+    #filepicker-box {
+        width: 70;
+        height: 80%;
+        background: #0d0d0d;
+        border: heavy #ff8c00;
+        padding: 1 2;
+    }
+    #filepicker-title {
+        text-align: center;
+        text-style: bold;
+        color: #ff8c00;
+        height: 1;
+        margin-bottom: 1;
+    }
+    #filepicker-path {
+        height: 1;
+        color: #555555;
+        margin-bottom: 1;
+    }
+    #filepicker-tree {
+        height: 1fr;
+        background: #0a0a0a;
+    }
+    #filepicker-hint {
+        height: 1;
+        color: #555555;
+        margin-top: 1;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, start_path: str = "~") -> None:
+        super().__init__()
+        self._start = Path(start_path).expanduser()
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="filepicker-box"):
+            yield Static("\u25c8 SELECT FILE \u25c8", id="filepicker-title")
+            yield Static(str(self._start), id="filepicker-path")
+            yield DirectoryTree(str(self._start), id="filepicker-tree")
+            yield Static("click file to attach // esc to cancel", id="filepicker-hint")
+
+    def on_directory_tree_file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self.dismiss(str(event.path))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class NewMessageScreen(ModalScreen[int | None]):
@@ -1588,6 +1719,7 @@ class M0usuNetApp(App):
     CSS_PATH = CSS_PATH
 
     BINDINGS = [
+        Binding("ctrl+c", "copy_selection", "Copy", show=False),
         Binding("tab", "toggle_focus", "Focus", show=False),
         Binding("escape", "escape", "Esc", show=False),
         Binding("slash", "search", "Search", show=False),
@@ -1601,6 +1733,7 @@ class M0usuNetApp(App):
         Binding("m", "context_menu", "Menu", show=False),
         Binding("question_mark", "show_help", "Help", show=False),
         Binding("ctrl+g", "suggest_reply", "Suggest", show=False),
+        Binding("v", "view_attachment", "View", show=False),
     ]
 
     def __init__(self) -> None:
@@ -1747,7 +1880,7 @@ class M0usuNetApp(App):
         if self._in_text_input():
             return
         try:
-            self.query_one("#compose-input", Input).focus()
+            self.query_one(ComposeBox).show_input()
         except Exception:
             pass
 
@@ -1822,6 +1955,74 @@ class M0usuNetApp(App):
             return
         self.push_screen(HelpScreen())
 
+    # ── Attachment viewer ──────────────────────────────────
+
+    def action_attach_file(self) -> None:
+        if self._current_contact_id is None:
+            return
+        self.push_screen(FilePickerScreen("~"), callback=self._on_file_picked)
+
+    def _on_file_picked(self, path: str | None) -> None:
+        if not path:
+            return
+        try:
+            compose = self.query_one(ComposeBox)
+            compose.set_attachment(path)
+            compose.show_input()
+        except Exception:
+            pass
+
+    def action_view_attachment(self) -> None:
+        if self._in_text_input():
+            return
+        try:
+            chat = self.query_one(ChatView)
+        except Exception:
+            return
+        att = chat.get_cursor_attachment()
+        if not att:
+            return
+        local = att.local_path
+        if not local or att.download_status != "done":
+            return
+        mime = att.mime_type or ""
+        if mime.startswith("image/"):
+            self._view_image(local)
+        else:
+            self._view_file(local, att.filename)
+
+    def _view_image(self, path: str) -> None:
+        """Suspend TUI and display image with kitten icat."""
+        import shutil
+        viewer = shutil.which("kitten")
+        if not viewer:
+            return
+        with self.suspend():
+            subprocess.run([viewer, "icat", "--hold", path])
+
+    def _view_file(self, path: str, filename: str) -> None:
+        """Suspend TUI and display file info / text content."""
+        with self.suspend():
+            print(f"\n  File: {filename}")
+            print(f"  Path: {path}")
+            mime = ""
+            try:
+                r = subprocess.run(["file", "--mime-type", "-b", path],
+                                   capture_output=True, text=True, timeout=5)
+                mime = r.stdout.strip()
+                print(f"  Type: {mime}")
+            except Exception:
+                pass
+            if mime.startswith("text/"):
+                print()
+                try:
+                    with open(path) as f:
+                        print(f.read()[:2000])
+                except Exception:
+                    pass
+            print("\n  Press Enter to return...")
+            input()
+
     # ── New Message modal ──────────────────────────────────
 
     def on_conversation_list_new_message_requested(self) -> None:
@@ -1891,7 +2092,7 @@ class M0usuNetApp(App):
             header = self.query_one(HeaderBar)
         except Exception:
             return
-        for tab_id in ("tab-messages", "tab-editor"):
+        for tab_id in ("tab-messages", "tab-compose"):
             try:
                 btn = header.query_one(f"#{tab_id}")
                 btn.set_class(tab_id == f"tab-{active}", "--active")
@@ -1935,7 +2136,7 @@ class M0usuNetApp(App):
             self._handle_schedule_command(body[4:])
             return
 
-        self._send_body(body)
+        self._send_body(body, attachment_path=event.attachment_path)
 
     def action_reply_editor(self) -> None:
         if isinstance(self.screen, ReplyEditorScreen):
@@ -1974,26 +2175,37 @@ class M0usuNetApp(App):
         compose.show_status(f"\u25c9 scheduled for {scheduled_at}")
         self._load_chat()
 
-    def _send_body(self, body: str) -> None:
+    def _send_body(self, body: str, attachment_path: str = "") -> None:
         if self._current_contact_id is None:
             return
         contact_name = self._current_contact_name
         contact_id = self._current_contact_id
         compose = self.query_one(ComposeBox)
-        compose.show_status("\u25c9 sending...")
+        status = "\u25c9 sending..." if not attachment_path else "\u25c9 uploading + sending..."
+        compose.show_status(status)
         threading.Thread(
             target=self._do_send,
-            args=(contact_id, contact_name, body),
+            args=(contact_id, contact_name, body, attachment_path),
             daemon=True,
         ).start()
 
-    def _do_send(self, contact_id: int, contact_name: str, body: str) -> None:
-        try:
-            output = send_message(contact_name, body)
-            success = True
-        except RelayError as e:
-            output = str(e)
-            success = False
+    def _do_send(self, contact_id: int, contact_name: str, body: str,
+                 attachment_path: str = "") -> None:
+        # If there's an attachment, SCP it to Mini first, then send via MQTT
+        if attachment_path:
+            try:
+                output = self._send_with_attachment(contact_name, body, attachment_path)
+                success = True
+            except Exception as e:
+                output = str(e)
+                success = False
+        else:
+            try:
+                output = send_message(contact_name, body)
+                success = True
+            except RelayError as e:
+                output = str(e)
+                success = False
 
         platform_str = "sms"
         if "imessage" in output.lower() or "imsg" in output.lower():
@@ -2021,13 +2233,57 @@ class M0usuNetApp(App):
         else:
             compose.show_status(f"\u25c9 RELAY FAIL  {output}", error=True)
 
+    def _send_with_attachment(self, contact_name: str, body: str,
+                              local_path: str) -> str:
+        """SCP file to Mini, then send via MQTT with attachment."""
+        import json as _json
+        filename = local_path.rsplit("/", 1)[-1]
+        remote_path = f"/tmp/m0usunet-send-{filename}"
+
+        # SCP to Mini
+        r = subprocess.run(
+            ["scp", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+             local_path, f"mini:{remote_path}"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if r.returncode != 0:
+            raise RelayError(f"SCP failed: {r.stderr.strip()}")
+
+        # Resolve phone number
+        from .db import get_connection, get_contact
+        with get_connection() as conn:
+            contact = get_contact(conn, self._current_contact_id)
+        if not contact or not contact.phone:
+            raise RelayError("no phone number for contact")
+
+        # Send via MQTT with attachment path
+        payload = _json.dumps({
+            "number": contact.phone,
+            "message": body if body and body != "[attachment]" else "",
+            "attachment": remote_path,
+        })
+        r = subprocess.run(
+            ["mosquitto_pub", "-h", "192.168.0.15", "-p", "8883",
+             "--cafile", "/home/jackpi5/mini-mqtt.crt",
+             "-t", "cmd/mini/imessage/send", "-m", payload],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            raise RelayError(f"MQTT publish failed: {r.stderr.strip()}")
+
+        return f"iMessage (MQTT+attachment) -> {contact_name}: {filename}"
+
     def action_toggle_focus(self) -> None:
         focused = self.focused
         if focused and focused.id == "compose-input":
+            try:
+                self.query_one(ComposeBox)._hide_input()
+            except Exception:
+                pass
             self.query_one(ConversationList).focus()
         else:
             try:
-                self.query_one("#compose-input", Input).focus()
+                self.query_one(ComposeBox).show_input()
             except Exception:
                 pass
 
@@ -2068,6 +2324,25 @@ class M0usuNetApp(App):
         except Exception:
             pass
         compose.show_status("\u25c9 suggestion loaded \u2014 edit or hit Enter to send")
+
+    def action_copy_selection(self) -> None:
+        """Copy selected text to system clipboard via OSC 52."""
+        import base64, os
+        try:
+            area = self.query_one("#chat-area", TextArea)
+            text = area.selected_text
+            if not text:
+                return
+            b64 = base64.b64encode(text.encode()).decode()
+            # Write directly to the TTY, bypassing Textual's stdout
+            try:
+                tty = os.open("/dev/tty", os.O_WRONLY)
+                os.write(tty, f"\033]52;c;{b64}\a".encode())
+                os.close(tty)
+            except OSError:
+                pass
+        except Exception:
+            pass
 
     def action_escape(self) -> None:
         conv_list = self.query_one(ConversationList)
