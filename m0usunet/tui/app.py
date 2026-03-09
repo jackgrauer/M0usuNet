@@ -20,7 +20,7 @@ from ..db import (
     conversation_list, delete_messages_for_contact,
     ensure_schema, get_connection, get_contact,
     get_messages, get_scheduled_for_contact,
-    mark_viewed, toggle_pin,
+    mark_viewed, toggle_mute, toggle_pin,
 )
 from ..exceptions import RelayError
 from ..relay import send_message
@@ -30,7 +30,7 @@ from .helpers import _parse_schedule_time
 from .screens import (
     ConfirmDeleteScreen, ConversationContextMenu,
     EditContactScreen, FilePickerScreen, HelpScreen,
-    NewMessageScreen, ReplyEditorScreen,
+    NewMessageScreen, QuickSwitchScreen, ReplyEditorScreen,
 )
 from .widgets import (
     ChatView, ComposeBox, ConversationList, DragHandle,
@@ -52,19 +52,25 @@ class M0usuNetApp(App):
         Binding("ctrl+c", "copy_selection", "Copy", show=False),
         Binding("tab", "toggle_focus", "Focus", show=False),
         Binding("escape", "escape", "Esc", show=False),
-        Binding("slash", "search", "Search", show=False),
-        Binding("r", "focus_compose", "Reply", show=False),
-        Binding("n", "new_message", "New", show=False),
-        Binding("d", "delete_conversation", "Delete", show=False),
-        Binding("j", "nav_down", "Down", show=False),
-        Binding("k", "nav_up", "Up", show=False),
-        Binding("g", "chat_top", "Top", show=False),
-        Binding("G", "chat_bottom", "Bottom", show=False, key_display="shift+g"),
-        Binding("m", "context_menu", "Menu", show=False),
-        Binding("question_mark", "show_help", "Help", show=False),
+        Binding("ctrl+n", "new_message", "New", show=False),
+        Binding("ctrl+d", "delete_conversation", "Delete", show=False),
+        Binding("ctrl+f", "filter_conversations", "Filter", show=False),
         Binding("ctrl+g", "suggest_reply", "Suggest", show=False),
-        Binding("v", "view_attachment", "View", show=False),
-        Binding("ctrl+r", "reload", "Reload", show=False),
+        Binding("ctrl+r", "search_chat", "Search chat", show=False),
+        Binding("ctrl+b", "bare_display", "Bare", show=False),
+        Binding("ctrl+k", "quick_switch", "Switch", show=False),
+        Binding("ctrl+shift+r", "reload", "Reload", show=False),
+        Binding("f1", "show_help", "Help", show=False),
+        Binding("question_mark", "show_help", "Help", show=False),
+        Binding("alt+1", "buffer_1", "Buf1", show=False),
+        Binding("alt+2", "buffer_2", "Buf2", show=False),
+        Binding("alt+3", "buffer_3", "Buf3", show=False),
+        Binding("alt+4", "buffer_4", "Buf4", show=False),
+        Binding("alt+5", "buffer_5", "Buf5", show=False),
+        Binding("alt+6", "buffer_6", "Buf6", show=False),
+        Binding("alt+7", "buffer_7", "Buf7", show=False),
+        Binding("alt+8", "buffer_8", "Buf8", show=False),
+        Binding("alt+9", "buffer_9", "Buf9", show=False),
     ]
 
     def __init__(self) -> None:
@@ -74,6 +80,8 @@ class M0usuNetApp(App):
         self._current_platform: str = ""
         self._current_phone: str = ""
         self._current_pinned: bool = False
+        self._current_muted: bool = False
+        self._bare_mode: bool = False
         self._ingest_thread = None
         self._initial_select_done = False
         self._last_msg_count: int = 0
@@ -147,7 +155,7 @@ class M0usuNetApp(App):
             self._initial_select_done = True
             c = convos[0]
             conv_list.post_message(
-                ConversationList.Selected(c.contact_id, c.display_name, c.platform)
+                ConversationList.Selected(c.contact_id, c.display_name, c.platform, c.phone or "", c.pinned, c.muted)
             )
 
     def on_conversation_list_selected(self, event: ConversationList.Selected) -> None:
@@ -156,6 +164,7 @@ class M0usuNetApp(App):
         self._current_platform = event.platform
         self._current_phone = event.phone
         self._current_pinned = event.pinned
+        self._current_muted = event.muted
         self._last_msg_count = 0
         self._load_chat()
         with get_connection() as conn:
@@ -168,63 +177,26 @@ class M0usuNetApp(App):
     def _load_chat(self) -> None:
         if self._current_contact_id is None:
             return
-        with get_connection() as conn:
-            msgs = get_messages(conn, self._current_contact_id)
-        chat = self.query_one(ChatView)
-        chat.set_messages(
-            msgs, self._current_contact_name, self._current_platform,
-            phone=self._current_phone, contact_id=self._current_contact_id,
-        )
+        try:
+            with get_connection() as conn:
+                msgs = get_messages(conn, self._current_contact_id)
+            chat = self.query_one(ChatView)
+            chat.set_messages(
+                msgs, self._current_contact_name, self._current_platform,
+                phone=self._current_phone, contact_id=self._current_contact_id,
+            )
+        except Exception as e:
+            log.exception("Failed to load chat for contact %s", self._current_contact_id)
 
     # ── Navigation ─────────────────────────────────────────
 
-    def _in_text_input(self) -> bool:
-        focused = self.focused
-        if focused is None:
-            return False
-        return isinstance(focused, Input) or (hasattr(focused, '__class__') and focused.__class__.__name__ == 'TextArea')
-
-    def action_nav_down(self) -> None:
-        if self._in_text_input():
-            return
-        self.query_one(ConversationList).action_down()
-
-    def action_nav_up(self) -> None:
-        if self._in_text_input():
-            return
-        self.query_one(ConversationList).action_up()
-
-    def action_chat_top(self) -> None:
-        if self._in_text_input():
-            return
-        self.query_one(ChatView).scroll_home(animate=False)
-
-    def action_chat_bottom(self) -> None:
-        if self._in_text_input():
-            return
-        self.query_one(ChatView).scroll_end(animate=False)
-
-    def action_search(self) -> None:
-        if self._in_text_input():
-            return
-        self.query_one(ConversationList).toggle_search()
-
-    def action_focus_compose(self) -> None:
-        if self._in_text_input():
-            return
-        try:
-            self.query_one(ComposeBox).show_input()
-        except Exception:
-            pass
-
     def action_new_message(self) -> None:
-        if self._in_text_input():
-            return
         self.on_conversation_list_new_message_requested()
 
+    def action_filter_conversations(self) -> None:
+        self.query_one(ConversationList).toggle_search()
+
     def action_context_menu(self) -> None:
-        if self._in_text_input():
-            return
         if self._current_contact_id is None:
             return
         with get_connection() as conn:
@@ -236,7 +208,7 @@ class M0usuNetApp(App):
         self.push_screen(
             ConversationContextMenu(
                 self._current_contact_name, self._current_phone, count,
-                pinned=self._current_pinned,
+                pinned=self._current_pinned, muted=self._current_muted,
             ),
             callback=self._on_context_menu_done,
         )
@@ -248,10 +220,11 @@ class M0usuNetApp(App):
         self._current_contact_name = event.display_name
         self._current_phone = event.phone
         self._current_pinned = event.pinned
+        self._current_muted = event.muted
         self.push_screen(
             ConversationContextMenu(
                 event.display_name, event.phone, event.message_count,
-                pinned=event.pinned,
+                pinned=event.pinned, muted=event.muted,
             ),
             callback=self._on_context_menu_done,
         )
@@ -282,16 +255,72 @@ class M0usuNetApp(App):
                 self._last_conv_ids = None
                 self._refresh_conversations()
                 self.notify("Pinned" if now_pinned else "Unpinned")
+        elif result == "toggle_mute":
+            if self._current_contact_id is not None:
+                with get_connection() as conn:
+                    now_muted = toggle_mute(conn, self._current_contact_id)
+                self._current_muted = now_muted
+                self._last_conv_ids = None
+                self._refresh_conversations()
+                self.notify("Muted" if now_muted else "Unmuted")
 
     def action_show_help(self) -> None:
-        if self._in_text_input():
-            return
         self.push_screen(HelpScreen())
+
+    def action_bare_display(self) -> None:
+        self._bare_mode = not self._bare_mode
+        hide = self._bare_mode
+        try:
+            self.query_one(HeaderBar).display = not hide
+            self.query_one(ConversationList).display = not hide
+            self.query_one("#drag-conv").display = not hide
+            self.query_one("#drag-chat").display = not hide
+            self.query_one(ComposeBox).display = not hide
+            self.query_one(ScheduleView).display = not hide
+        except Exception:
+            pass
+        if hide:
+            self.notify("Bare mode \u2014 Ctrl+B to exit")
+        else:
+            self.notify("Normal mode")
+
+    def action_search_chat(self) -> None:
+        try:
+            self.query_one(ChatView).toggle_search()
+        except Exception:
+            pass
+
+    def action_quick_switch(self) -> None:
+        self.push_screen(QuickSwitchScreen(), callback=self._on_quick_switch_done)
+
+    def _on_quick_switch_done(self, contact_id: int | None) -> None:
+        if contact_id is None:
+            return
+        conv_list = self.query_one(ConversationList)
+        for i, c in enumerate(conv_list._visible_conversations):
+            if c.contact_id == contact_id:
+                conv_list.selected_index = i
+                break
 
     def action_reload(self) -> None:
         """Hot reload — exit with special code so wrapper restarts the app."""
         self._reload_requested = True
         self.exit()
+
+    def _switch_buffer(self, n: int) -> None:
+        conv_list = self.query_one(ConversationList)
+        if n < len(conv_list._visible_conversations):
+            conv_list.selected_index = n
+
+    def action_buffer_1(self) -> None: self._switch_buffer(0)
+    def action_buffer_2(self) -> None: self._switch_buffer(1)
+    def action_buffer_3(self) -> None: self._switch_buffer(2)
+    def action_buffer_4(self) -> None: self._switch_buffer(3)
+    def action_buffer_5(self) -> None: self._switch_buffer(4)
+    def action_buffer_6(self) -> None: self._switch_buffer(5)
+    def action_buffer_7(self) -> None: self._switch_buffer(6)
+    def action_buffer_8(self) -> None: self._switch_buffer(7)
+    def action_buffer_9(self) -> None: self._switch_buffer(8)
 
     # ── Attachment viewer ──────────────────────────────────
 
@@ -311,8 +340,6 @@ class M0usuNetApp(App):
             pass
 
     def action_view_attachment(self) -> None:
-        if self._in_text_input():
-            return
         try:
             chat = self.query_one(ChatView)
         except Exception:
@@ -439,8 +466,6 @@ class M0usuNetApp(App):
             compose.set_contact_name(new_name)
 
     def action_delete_conversation(self) -> None:
-        if self._in_text_input():
-            return
         if self._current_contact_id is None:
             return
         with get_connection() as conn:
@@ -614,6 +639,9 @@ class M0usuNetApp(App):
             except RelayError as e:
                 output = str(e)
                 success = False
+            except Exception as e:
+                output = f"unexpected error: {e}"
+                success = False
 
         platform_str = "sms"
         if "imessage" in output.lower() or "imsg" in output.lower():
@@ -680,7 +708,6 @@ class M0usuNetApp(App):
         return f"iMessage (MQTT+attachment) -> {contact_name}: {filename}"
 
     def action_toggle_focus(self) -> None:
-        # If in text input, Tab cycles focus within messages view
         focused = self.focused
         if focused and focused.id == "compose-input":
             try:
@@ -688,12 +715,11 @@ class M0usuNetApp(App):
             except Exception:
                 pass
             self.query_one(ConversationList).focus()
-            return
-        # Otherwise, Tab toggles between MESSAGES and SCHEDULE
-        if self._active_tab == "messages":
-            self.action_show_schedule()
         else:
-            self.action_show_messages()
+            try:
+                self.query_one(ComposeBox).show_input()
+            except Exception:
+                pass
 
     # ── Claude suggestion ───────────────────────────────
 
@@ -752,6 +778,14 @@ class M0usuNetApp(App):
             pass
 
     def action_escape(self) -> None:
+        # Close chat search if active
+        try:
+            chat = self.query_one(ChatView)
+            if chat._search_active:
+                chat.toggle_search()
+                return
+        except Exception:
+            pass
         conv_list = self.query_one(ConversationList)
         if conv_list._search_active:
             conv_list.toggle_search()

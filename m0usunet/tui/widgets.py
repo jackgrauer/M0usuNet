@@ -139,7 +139,7 @@ class HeaderBar(Widget):
             yield Static(" ", id="title-spacer")
             yield TabButton(" MESSAGES (Tab) ", id="tab-messages", classes="tab-btn --active")
             yield TabButton(" SCHEDULE (Tab) ", id="tab-schedule", classes="tab-btn")
-            yield _HeaderReloadButton(" RELOAD (^R) ", id="reload-btn")
+            yield _HeaderReloadButton(" RELOAD (^⇧R) ", id="reload-btn")
             yield Static("", id="spacer", classes="header-spacer")
             yield Static("", id="ingest-status")
             yield Static("", id="mesh-status")
@@ -404,7 +404,7 @@ class NewMessageButton(Static):
     """
 
     def __init__(self) -> None:
-        super().__init__("+ NEW (n)")
+        super().__init__("+ NEW (^N)")
 
     def on_click(self) -> None:
         for ancestor in self.ancestors:
@@ -434,8 +434,9 @@ class ConversationItem(Widget):
         self.index = index
 
     @staticmethod
-    def _render_lines(c: ConversationSummary) -> tuple[str, str]:
+    def _render_lines(c: ConversationSummary, index: int = -1) -> tuple[str, str]:
         tag_label, tag_color = PLATFORM_STYLE.get(c.platform, (c.platform[:4], "#555555"))
+        buf_prefix = f"[#555555]{index + 1}[/] " if 0 <= index < 9 else ""
 
         time_str = ""
         if c.last_time:
@@ -447,9 +448,10 @@ class ConversationItem(Widget):
                 time_str = local_time.strftime("%b %-d")
 
         pin = "[#ff8c00]\u2605[/] " if c.pinned else ""
+        mute = "[#555555]~[/] " if c.muted else ""
 
         name_line = (
-            f"{pin}[{tag_color}]\\[{tag_label}][/] "
+            f"{buf_prefix}{pin}{mute}[{tag_color}]\\[{tag_label}][/] "
             f"{c.display_name}"
             f"  [#555555]{time_str}[/]"
         )
@@ -460,14 +462,14 @@ class ConversationItem(Widget):
         return name_line, preview_line
 
     def compose(self) -> ComposeResult:
-        name_line, preview_line = self._render_lines(self._convo)
+        name_line, preview_line = self._render_lines(self._convo, self.index)
         yield Static(name_line, classes="conv-name")
         yield Static(preview_line, classes="conv-preview")
 
     def update_convo(self, convo: ConversationSummary, index: int) -> None:
         self._convo = convo
         self.index = index
-        name_line, preview_line = self._render_lines(convo)
+        name_line, preview_line = self._render_lines(convo, index)
         children = list(self.children)
         if len(children) >= 2:
             children[0].update(name_line)
@@ -479,41 +481,41 @@ class ConversationItem(Widget):
                 ancestor.selected_index = self.index
                 if event.button == 3:
                     ancestor._request_context_menu(self.index)
-                # If name looks like a phone number, open edit contact
-                elif self._convo.display_name.startswith("+"):
-                    self.app.action_edit_contact()
                 break
 
 
 class ConversationList(VerticalScroll):
-    """Scrollable list of conversations with search and vim nav."""
+    """Scrollable list of conversations with arrow key navigation."""
 
     BORDER_TITLE = "\u25c8 NODES \u25c8"
+    can_focus = True
 
     class Selected(TMessage):
         """Fired when a conversation is selected."""
 
-        def __init__(self, contact_id: int, display_name: str, platform: str = "sms", phone: str = "", pinned: bool = False) -> None:
+        def __init__(self, contact_id: int, display_name: str, platform: str = "sms", phone: str = "", pinned: bool = False, muted: bool = False) -> None:
             super().__init__()
             self.contact_id = contact_id
             self.display_name = display_name
             self.platform = platform
             self.phone = phone
             self.pinned = pinned
+            self.muted = muted
 
     class NewMessageRequested(TMessage):
         """Fired when the user wants to start a new conversation."""
 
     class ContextMenuRequested(TMessage):
-        """Fired on right-click or 'm' key for context menu."""
+        """Fired on right-click for context menu."""
 
-        def __init__(self, contact_id: int, display_name: str, phone: str, message_count: int, pinned: bool = False) -> None:
+        def __init__(self, contact_id: int, display_name: str, phone: str, message_count: int, pinned: bool = False, muted: bool = False) -> None:
             super().__init__()
             self.contact_id = contact_id
             self.display_name = display_name
             self.phone = phone
             self.message_count = message_count
             self.pinned = pinned
+            self.muted = muted
 
     selected_index: reactive[int] = reactive(0)
 
@@ -595,7 +597,7 @@ class ConversationList(VerticalScroll):
         convos = self._visible_conversations
         if convos and 0 <= self.selected_index < len(convos):
             c = convos[self.selected_index]
-            self.post_message(self.Selected(c.contact_id, c.display_name, c.platform, c.phone or "", c.pinned))
+            self.post_message(self.Selected(c.contact_id, c.display_name, c.platform, c.phone or "", c.pinned, c.muted))
 
     def action_up(self) -> None:
         if self.selected_index > 0:
@@ -604,6 +606,20 @@ class ConversationList(VerticalScroll):
     def action_down(self) -> None:
         if self.selected_index < len(self._visible_conversations) - 1:
             self.selected_index += 1
+
+    def on_key(self, event) -> None:
+        if event.key == "up":
+            self.action_up()
+            event.stop()
+        elif event.key == "down":
+            self.action_down()
+            event.stop()
+        elif event.key == "enter":
+            try:
+                self.app.query_one("ComposeBox").show_input()
+            except Exception:
+                pass
+            event.stop()
 
     def toggle_search(self) -> None:
         """Toggle search bar visibility."""
@@ -639,7 +655,7 @@ class ConversationList(VerticalScroll):
         if 0 <= index < len(convos):
             c = convos[index]
             self.post_message(self.ContextMenuRequested(
-                c.contact_id, c.display_name, c.phone or "", 0, c.pinned,
+                c.contact_id, c.display_name, c.phone or "", 0, c.pinned, c.muted,
             ))
 
     @property
@@ -665,12 +681,16 @@ class ChatView(Vertical):
         self._raw_messages: list[Message] = []
         self._line_directions: dict[int, str] = {}
         self.border_title = "\u256c\u2500 SELECT A NODE \u256c\u2500"
+        self._search_active = False
+        self._search_matches: list[int] = []
+        self._search_idx: int = 0
 
     @property
     def message_count(self) -> int:
         return self._message_count
 
     def compose(self) -> ComposeResult:
+        yield Input(placeholder="search messages...", id="chat-search")
         area = TextArea("", read_only=True, id="chat-area", show_line_numbers=False)
         area.register_theme(_CHAT_THEME)
         area.theme = "m0usunet"
@@ -837,6 +857,85 @@ class ChatView(Vertical):
         self.border_title = (
             f"\u256c\u2500 {self._contact_name.upper()} {phone} // {platform_upper} via {device} // {count}{reply_part} \u256c\u2500"
         )
+
+    def toggle_search(self) -> None:
+        self._search_active = not self._search_active
+        try:
+            search_input = self.query_one("#chat-search", Input)
+            search_input.set_class(self._search_active, "--visible")
+            if self._search_active:
+                search_input.value = ""
+                search_input.focus()
+            else:
+                self._search_matches = []
+                self._search_idx = 0
+                search_input.value = ""
+        except Exception:
+            pass
+
+    def _do_search(self, query: str) -> None:
+        self._search_matches = []
+        self._search_idx = 0
+        if not query:
+            try:
+                self.query_one("#chat-search", Input).placeholder = "search messages..."
+            except Exception:
+                pass
+            return
+        q = query.lower()
+        try:
+            area = self.query_one("#chat-area", TextArea)
+            for i, line in enumerate(area.text.splitlines()):
+                if q in line.lower():
+                    self._search_matches.append(i)
+        except Exception:
+            pass
+        self._update_search_placeholder()
+        if self._search_matches:
+            self._scroll_to_match()
+
+    def _update_search_placeholder(self) -> None:
+        try:
+            search_input = self.query_one("#chat-search", Input)
+            total = len(self._search_matches)
+            if total:
+                search_input.placeholder = f"{self._search_idx + 1}/{total} matches"
+            else:
+                search_input.placeholder = "no matches"
+        except Exception:
+            pass
+
+    def _scroll_to_match(self) -> None:
+        if not self._search_matches:
+            return
+        line = self._search_matches[self._search_idx]
+        try:
+            area = self.query_one("#chat-area", TextArea)
+            area.move_cursor((line, 0))
+            area.scroll_cursor_visible()
+        except Exception:
+            pass
+        self._update_search_placeholder()
+
+    def search_next(self) -> None:
+        if not self._search_matches:
+            return
+        self._search_idx = (self._search_idx + 1) % len(self._search_matches)
+        self._scroll_to_match()
+
+    def search_prev(self) -> None:
+        if not self._search_matches:
+            return
+        self._search_idx = (self._search_idx - 1) % len(self._search_matches)
+        self._scroll_to_match()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "chat-search":
+            self._do_search(event.value.strip())
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "chat-search":
+            self.search_next()
 
     def get_messages_text(self) -> list[tuple[str, str, str]]:
         return list(self._messages_data)

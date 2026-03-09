@@ -106,6 +106,9 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON scheduled_messages(status, scheduled_at)
             WHERE status = 'pending';
     """),
+    (7, """
+        ALTER TABLE contacts ADD COLUMN muted INTEGER DEFAULT 0;
+    """),
 ]
 
 
@@ -118,6 +121,7 @@ class Contact(BaseModel):
     created_at: Optional[datetime] = None
     last_viewed_at: Optional[datetime] = None
     pinned: bool = False
+    muted: bool = False
 
 
 class Message(BaseModel):
@@ -166,6 +170,7 @@ class ConversationSummary(BaseModel):
     direction: str
     unread_count: int = 0
     pinned: bool = False
+    muted: bool = False
 
 
 # ── Connection ────────────────────────────────────────────
@@ -305,6 +310,17 @@ def toggle_pin(conn: sqlite3.Connection, contact_id: int) -> bool:
     return False
 
 
+def toggle_mute(conn: sqlite3.Connection, contact_id: int) -> bool:
+    """Toggle muted status for a contact. Returns new muted state."""
+    row = conn.execute("SELECT muted FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+    if row:
+        new_val = 0 if row["muted"] else 1
+        conn.execute("UPDATE contacts SET muted = ? WHERE id = ?", (new_val, contact_id))
+        conn.commit()
+        return bool(new_val)
+    return False
+
+
 # ── Messages ──────────────────────────────────────────────
 
 def add_message(
@@ -414,6 +430,7 @@ def conversation_list(conn: sqlite3.Connection) -> list[ConversationSummary]:
             m.sent_at AS last_time,
             m.direction,
             c.pinned,
+            c.muted,
             (SELECT COUNT(*) FROM messages
              WHERE contact_id = c.id AND direction = 'in'
              AND sent_at > COALESCE(c.last_viewed_at, '1970-01-01')

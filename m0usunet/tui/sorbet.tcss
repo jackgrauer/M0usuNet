@@ -215,6 +215,24 @@ ChatView {
     background: #0a0a0a;
 }
 
+#chat-search {
+    dock: top;
+    height: 1;
+    display: none;
+    background: #111111;
+    color: #e0e0e0;
+    border: none;
+    padding: 0;
+}
+
+#chat-search.--visible {
+    display: block;
+}
+
+#chat-search:focus {
+    border: none;
+}
+
 #chat-area {
     background: #0a0a0a;
     color: #e0e0e0;

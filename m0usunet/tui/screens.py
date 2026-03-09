@@ -13,7 +13,7 @@ from textual.screen import ModalScreen, Screen
 from textual.widgets import DirectoryTree, Input, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
-from ..db import get_connection, search_contacts, upsert_contact
+from ..db import conversation_list, get_connection, search_contacts, upsert_contact
 
 from .helpers import REPLY_PATH, _PHONE_RE
 from .widgets import TabButton
@@ -216,22 +216,26 @@ class ConversationContextMenu(ModalScreen[str | None]):
         ("c", "pick_copy", "Copy"),
         ("r", "pick_read", "Read"),
         ("p", "pick_pin", "Pin"),
+        ("m", "pick_mute", "Mute"),
     ]
 
-    def __init__(self, contact_name: str, phone: str, message_count: int, pinned: bool = False) -> None:
+    def __init__(self, contact_name: str, phone: str, message_count: int, pinned: bool = False, muted: bool = False) -> None:
         super().__init__()
         self._contact_name = contact_name
         self._phone = phone
         self._message_count = message_count
         self._pinned = pinned
+        self._muted = muted
 
     def compose(self) -> ComposeResult:
         pin_label = "Unpin from top" if self._pinned else "Pin to top"
+        mute_label = "Unmute" if self._muted else "Mute"
         with Vertical(id="ctx-box"):
             yield Static(f"\u25c8 {self._contact_name} \u25c8", id="ctx-title")
             if self._phone:
                 yield Static(self._phone, id="ctx-phone")
             yield _CtxOption(f"[#ff8c00]p[/]  {pin_label}", "toggle_pin")
+            yield _CtxOption(f"[#555555]m[/]  {mute_label}", "toggle_mute")
             yield _CtxOption("[#f75341]d[/]  Delete conversation", "delete")
             yield _CtxOption("[#00d4ff]c[/]  Copy phone number", "copy_phone")
             yield _CtxOption("[#50fa7b]r[/]  Mark as read", "mark_read")
@@ -248,6 +252,9 @@ class ConversationContextMenu(ModalScreen[str | None]):
 
     def action_pick_pin(self) -> None:
         self.dismiss("toggle_pin")
+
+    def action_pick_mute(self) -> None:
+        self.dismiss("toggle_mute")
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -670,6 +677,90 @@ class ReplyEditorScreen(Screen):
             )
 
 
+# ── Quick switcher ────────────────────────────────────────
+
+class QuickSwitchScreen(ModalScreen[int | None]):
+    """Ctrl+K quick switcher for jumping between conversations."""
+
+    DEFAULT_CSS = """
+    QuickSwitchScreen {
+        align: center middle;
+    }
+    #quick-switch-box {
+        width: 50;
+        max-height: 20;
+        background: #0d0d0d;
+        border: heavy #00d4ff;
+        padding: 1 2;
+    }
+    #quick-switch-title {
+        color: #00d4ff;
+        text-style: bold;
+        text-align: center;
+        margin-bottom: 1;
+    }
+    #quick-switch-input {
+        background: #111111;
+        color: #e0e0e0;
+        border: none;
+        width: 100%;
+    }
+    #quick-switch-input:focus {
+        border: none;
+    }
+    #quick-switch-results {
+        height: auto;
+        max-height: 10;
+        background: #0a0a0a;
+        color: #e0e0e0;
+        margin-top: 1;
+    }
+    #quick-switch-results > .option-list--option-highlighted {
+        background: #111a22;
+        color: #00d4ff;
+    }
+    """
+
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._convos = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="quick-switch-box"):
+            yield Static("\u25c8 QUICK SWITCH \u25c8", id="quick-switch-title")
+            yield Input(placeholder="jump to conversation...", id="quick-switch-input")
+            yield OptionList(id="quick-switch-results")
+
+    def on_mount(self) -> None:
+        with get_connection() as conn:
+            self._convos = conversation_list(conn)
+        self._populate("")
+        self.query_one("#quick-switch-input", Input).focus()
+
+    def _populate(self, query: str) -> None:
+        option_list = self.query_one("#quick-switch-results", OptionList)
+        option_list.clear_options()
+        q = query.lower()
+        for c in self._convos:
+            if q and q not in c.display_name.lower():
+                continue
+            unread = f" [#f75341]({c.unread_count})[/]" if c.unread_count else ""
+            label = f"{c.display_name}{unread}  [#555555]{c.phone or ''}[/]"
+            option_list.add_option(Option(label, id=str(c.contact_id)))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "quick-switch-input":
+            self._populate(event.value.strip())
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(int(event.option.id))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Help screen ──────────────────────────────────────────
 
 class HelpScreen(ModalScreen):
@@ -705,7 +796,7 @@ class HelpScreen(ModalScreen):
 
     BINDINGS = [
         ("escape", "dismiss", "Close"),
-        ("question_mark", "dismiss", "Close"),
+        ("f1", "dismiss", "Close"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -713,21 +804,24 @@ class HelpScreen(ModalScreen):
             yield Static("\u25c8 KEYBINDINGS \u25c8", id="help-title")
             yield Static(
                 "[#00d4ff bold]NAVIGATION[/]\n"
-                "  [#50fa7b]j / k[/]       move down / up in sidebar\n"
-                "  [#50fa7b]g / G[/]       scroll chat to top / bottom\n"
-                "  [#50fa7b]Tab[/]         toggle focus: sidebar <-> compose\n"
+                "  [#50fa7b]\u2191 / \u2193[/]       move up / down in sidebar\n"
+                "  [#50fa7b]Enter[/]       focus compose box\n"
+                "  [#50fa7b]Tab[/]         toggle sidebar <-> compose\n"
                 "  [#50fa7b]Esc[/]         close search / clear compose\n"
+                "  [#50fa7b]Alt+1..9[/]    jump to conversation by number\n"
                 "\n"
                 "[#00d4ff bold]ACTIONS[/]\n"
-                "  [#50fa7b]r[/]           focus compose box (quick reply)\n"
-                "  [#50fa7b]n[/]           new message\n"
-                "  [#50fa7b]d[/]           delete conversation\n"
-                "  [#50fa7b]m[/]           context menu (delete/copy/mark read)\n"
-                "  [#50fa7b]/[/]           search/filter conversations\n"
+                "  [#50fa7b]Ctrl+N[/]      new message\n"
+                "  [#50fa7b]Ctrl+D[/]      delete conversation\n"
+                "  [#50fa7b]Ctrl+F[/]      filter/search conversations\n"
+                "  [#50fa7b]Ctrl+K[/]      quick switcher\n"
+                "  [#50fa7b]Ctrl+R[/]      search within chat\n"
+                "  [#50fa7b]Ctrl+B[/]      bare display (fullscreen chat)\n"
+                "  [#50fa7b]Ctrl+G[/]      suggest reply (Claude)\n"
+                "  [#50fa7b]Ctrl+Shift+R[/] reload (hot restart)\n"
                 "  [#50fa7b]?[/]           this help screen\n"
                 "\n"
                 "[#00d4ff bold]COMPOSE[/]\n"
-                "  [#50fa7b]ctrl+g[/]      suggest reply (Claude)\n"
                 "  [#50fa7b]Enter[/]       send message\n"
                 "  [#50fa7b]REPLY btn[/]   open full editor\n"
                 "  [#50fa7b]CLAUDE btn[/]  AI rewrite in editor\n"
@@ -740,11 +834,11 @@ class HelpScreen(ModalScreen):
                 "  [#50fa7b]/cancel all[/] cancel all scheduled\n"
                 "  [#50fa7b]/scheduled[/]  list pending scheduled\n"
                 "\n"
-                "[#00d4ff bold]CHAT (read-only TextArea)[/]\n"
+                "[#00d4ff bold]CHAT[/]\n"
                 "  [#50fa7b]click+drag[/]  select text\n"
                 "  [#50fa7b]shift+arrows[/] select with keyboard\n"
-                "  [#50fa7b]ctrl+c[/]      copy selection\n"
-                "  [#50fa7b]ctrl+a[/]      select all\n"
+                "  [#50fa7b]Ctrl+C[/]      copy selection\n"
+                "  [#50fa7b]Ctrl+A[/]      select all\n"
                 "  [#50fa7b]Home/End[/]    scroll to top/bottom\n",
                 id="help-body",
             )

@@ -11,16 +11,23 @@ from .db import (
 )
 
 
-RELOAD_EXIT_CODE = 42
-
-
 def cmd_run(_args: argparse.Namespace) -> None:
     ensure_schema()
     from .tui import M0usuNetApp
     app = M0usuNetApp()
-    app.run()
-    if getattr(app, '_reload_requested', False):
-        sys.exit(RELOAD_EXIT_CODE)
+    try:
+        app.run()
+    except Exception:
+        import traceback
+        with open("/tmp/m0usunet_crash.log", "a") as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"Crash at {__import__('datetime').datetime.now().isoformat()}\n")
+            traceback.print_exc(file=f)
+        raise
+    if getattr(app, "_reload_requested", False):
+        import os
+        python = sys.executable
+        os.execv(python, [python, "-m", "m0usunet"])
 
 
 def cmd_import_contacts(_args: argparse.Namespace) -> None:
