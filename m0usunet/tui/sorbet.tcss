@@ -61,9 +61,9 @@ HeaderBar #clock {
     color: #50fa7b;
 }
 
-#tab-editor.--active {
-    background: #1a1a2a;
-    color: #00d4ff;
+#tab-schedule.--active {
+    background: #2a1a00;
+    color: #ff8c00;
 }
 
 HeaderBar #ingest-status {
@@ -77,11 +77,106 @@ HeaderBar #mesh-status {
     margin: 0 1 0 0;
 }
 
+HeaderBar #reload-btn {
+    width: auto;
+    margin: 0 1 0 0;
+    background: #1a1a2a;
+    color: #00d4ff;
+    text-style: bold;
+}
+
+HeaderBar #reload-btn:hover {
+    background: #00d4ff;
+    color: #0a0a0a;
+}
+
+/* ── Schedule view ── */
+
+ScheduleView {
+    display: none;
+    height: 1fr;
+    background: #0a0a0a;
+    padding: 0 1;
+}
+
+.sched-section-title {
+    color: #ff8c00;
+    text-style: bold;
+    height: 1;
+    margin: 1 0 0 0;
+}
+
+.sched-sent-header {
+    color: #555555;
+}
+
+#sched-pending-list {
+    height: auto;
+    max-height: 50%;
+    background: #0a0a0a;
+}
+
+#sched-sent-list {
+    height: auto;
+    max-height: 30%;
+    background: #0a0a0a;
+}
+
+.sched-row {
+    height: 1;
+    padding: 0 1;
+    background: #0a0a0a;
+    border-left: thick #0a0a0a;
+}
+
+.sched-row:hover {
+    background: #151520;
+}
+
+.sched-row.--selected {
+    background: #1a1520;
+    border-left: thick #ff8c00;
+}
+
+.sched-row-text {
+    width: 1fr;
+    height: 1;
+}
+
+.sched-cancel-btn {
+    width: auto;
+    height: 1;
+    color: #f75341;
+    background: #0a0a0a;
+}
+
+.sched-cancel-btn:hover {
+    background: #f75341;
+    color: #0a0a0a;
+}
+
+.sched-row-sent {
+    height: 1;
+    padding: 0 1;
+}
+
+.sched-empty {
+    color: #555555;
+    padding: 1 1;
+}
+
+#sched-hints {
+    dock: bottom;
+    height: 1;
+    color: #555555;
+    background: #0d0d0d;
+    padding: 0 1;
+}
+
 /* ── Left panel: conversation list ── */
 
 ConversationList {
     height: 10;
-    border-bottom: heavy #00d4ff;
     padding: 0;
     background: #0a0a0a;
 }
@@ -91,11 +186,12 @@ ConversationItem {
     padding: 0 1;
     background: #0a0a0a;
     color: #e0e0e0;
+    border-left: thick #0a0a0a;
 }
 
 ConversationItem.--highlight {
-    background: #111a22;
-    color: #00d4ff;
+    background: #152030;
+    border-left: thick #00d4ff;
 }
 
 .conv-name {
@@ -114,6 +210,7 @@ ConversationItem.--highlight {
 /* ── Right panel: chat TextArea ── */
 
 ChatView {
+    height: 1fr;
     padding: 0;
     background: #0a0a0a;
 }
@@ -145,13 +242,55 @@ ChatView {
     background: #50fa7b;
 }
 
+#attach-btn {
+    width: auto;
+    height: 1;
+    background: #2a1a00;
+    color: #ff8c00;
+    text-style: bold;
+}
+
+#attach-btn:hover {
+    color: #0a0a0a;
+    background: #ff8c00;
+}
+
+#delete-btn {
+    width: auto;
+    height: 1;
+    background: #2a0a0a;
+    color: #f75341;
+    text-style: bold;
+}
+
+#delete-btn:hover {
+    color: #0a0a0a;
+    background: #f75341;
+}
+
+#help-btn {
+    width: auto;
+    height: 1;
+    background: #1a1a1a;
+    color: #555555;
+    text-style: bold;
+}
+
+#help-btn:hover {
+    color: #0a0a0a;
+    background: #555555;
+}
+
+#attach-indicator {
+    height: 1;
+    color: #ff8c00;
+}
+
 ComposeBox {
     height: auto;
-    max-height: 3;
-    dock: bottom;
+    max-height: 6;
     padding: 0;
     background: #0d0d0d;
-    border-top: heavy #1a5c7a;
 }
 
 ComposeBox Horizontal {
@@ -176,6 +315,14 @@ ComposeBox Input {
 ComposeBox Input:focus {
     border: none;
     color: #e0e0e0;
+}
+
+ComposeBox Input.--over-limit {
+    color: #f75341;
+}
+
+ComposeBox Input.--over-limit:focus {
+    color: #f75341;
 }
 
 ComposeBox Input.-placeholder {

@@ -3,6 +3,7 @@
 import logging
 import threading
 import time
+from typing import Callable, Optional
 
 from .db import (
     add_message, get_connection, get_contact, get_pending_scheduled,
@@ -15,6 +16,14 @@ log = logging.getLogger(__name__)
 
 CHECK_INTERVAL = 30  # seconds
 MAX_ATTEMPTS = 3
+
+_on_sent_callback: Optional[Callable[[str, str], None]] = None
+
+
+def set_on_sent(callback: Optional[Callable[[str, str], None]]) -> None:
+    """Register a callback(contact_name, body) for when a scheduled message fires."""
+    global _on_sent_callback
+    _on_sent_callback = callback
 
 
 def _process_due_messages() -> int:
@@ -56,6 +65,11 @@ def _process_due_messages() -> int:
                 mark_scheduled_sent(conn, sched.id)
             log.info("Scheduled message sent: %s -> %s", contact.display_name, sched.body[:40])
             sent += 1
+            if _on_sent_callback:
+                try:
+                    _on_sent_callback(contact.display_name, sched.body)
+                except Exception:
+                    pass
         else:
             with get_connection() as conn:
                 # Increment attempts; mark failed if at max

@@ -523,6 +523,29 @@ def get_scheduled_for_contact(
     return [ScheduledMessage(**dict(r)) for r in rows]
 
 
+def get_all_scheduled(conn: sqlite3.Connection, include_done: bool = False) -> list[dict]:
+    """Get all scheduled messages with contact names."""
+    where = "" if include_done else "WHERE s.status = 'pending'"
+    order = "s.scheduled_at ASC" if not include_done else "CASE WHEN s.status = 'pending' THEN 0 ELSE 1 END, s.scheduled_at DESC"
+    rows = conn.execute(
+        f"SELECT s.*, c.display_name, c.phone FROM scheduled_messages s "
+        f"JOIN contacts c ON c.id = s.contact_id "
+        f"{where} ORDER BY {order} LIMIT 50",
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def cancel_scheduled_by_id(conn: sqlite3.Connection, sched_id: int) -> bool:
+    """Cancel a single scheduled message by id. Returns True if cancelled."""
+    cur = conn.execute(
+        "UPDATE scheduled_messages SET status = 'cancelled' "
+        "WHERE id = ? AND status = 'pending'",
+        (sched_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def cancel_scheduled(conn: sqlite3.Connection, contact_id: int, cancel_all: bool = False) -> int:
     """Cancel pending scheduled messages. Returns count cancelled."""
     if cancel_all:
