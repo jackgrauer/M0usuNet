@@ -1,4 +1,4 @@
-"""CLI entrypoint: run (default), import-contacts, seed, ingest, link, sources, merge."""
+"""CLI entrypoint: daemon (default), import-contacts, seed, ingest, link, sources, merge."""
 
 import argparse
 import logging
@@ -11,23 +11,19 @@ from .db import (
 )
 
 
-def cmd_run(_args: argparse.Namespace) -> None:
+def cmd_daemon(args: argparse.Namespace) -> None:
+    """Run ingest + scheduler as a headless daemon."""
     ensure_schema()
-    from .tui import M0usuNetApp
-    app = M0usuNetApp()
-    try:
-        app.run()
-    except Exception:
-        import traceback
-        with open("/tmp/m0usunet_crash.log", "a") as f:
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Crash at {__import__('datetime').datetime.now().isoformat()}\n")
-            traceback.print_exc(file=f)
-        raise
-    if getattr(app, "_reload_requested", False):
-        import os
-        python = sys.executable
-        os.execv(python, [python, "-m", "m0usunet"])
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    from .scheduler import start_background as start_scheduler
+    start_scheduler(interval=30)
+    from .ingest import run_forever
+    interval = getattr(args, "interval", 30)
+    run_forever(interval=interval)
 
 
 def cmd_import_contacts(_args: argparse.Namespace) -> None:
@@ -202,14 +198,19 @@ def cmd_merge(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(prog="m0usunet", description="Unified messaging TUI")
+    parser = argparse.ArgumentParser(prog="m0usunet", description="Headless messaging daemon")
     sub = parser.add_subparsers(dest="command")
 
-    sub.add_parser("run", help="Launch TUI (default)")
+    daemon_parser = sub.add_parser("daemon", help="Run ingest + scheduler daemon (default)")
+    daemon_parser.add_argument(
+        "--interval", type=int, default=30,
+        help="Poll interval in seconds (default: 30)",
+    )
+
     sub.add_parser("import-contacts", help="Import from ~/contacts.tsv")
     sub.add_parser("seed", help="Create test conversations")
 
-    ingest_parser = sub.add_parser("ingest", help="Run ingest daemon")
+    ingest_parser = sub.add_parser("ingest", help="Run ingest only (no scheduler)")
     ingest_parser.add_argument(
         "--interval", type=int, default=30,
         help="Poll interval in seconds (default: 30)",
@@ -230,8 +231,11 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command is None or args.command == "run":
-        cmd_run(args)
+    if args.command is None:
+        parser.print_help()
+        sys.exit(0)
+    elif args.command == "daemon":
+        cmd_daemon(args)
     elif args.command == "import-contacts":
         cmd_import_contacts(args)
     elif args.command == "seed":

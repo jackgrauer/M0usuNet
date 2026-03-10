@@ -1,3 +1,3 @@
-"""m0usunet — unified messaging TUI."""
+"""m0usunet — headless messaging daemon."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

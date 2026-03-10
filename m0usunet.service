@@ -1,0 +1,13 @@
+[Unit]
+Description=m0usunet messaging daemon
+After=network-online.target
+
+[Service]
+Type=simple
+User=jackpi5
+ExecStart=/home/jackpi5/m0usunet/.venv/bin/python3 -m m0usunet daemon
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

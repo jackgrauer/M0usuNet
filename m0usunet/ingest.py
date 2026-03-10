@@ -35,7 +35,7 @@ POLL_INTERVAL = 30  # seconds (watchdog check interval)
 MQTT_BROKER = "192.168.0.15"
 MQTT_PORT = 8883
 MQTT_CA = "/home/jackpi5/mini-mqtt.crt"
-MQTT_CLIENT_ID = "m0usunet-ingest"
+MQTT_CLIENT_ID = "m0usunet-daemon"
 
 # Topics
 TOPIC_MINI_MESSAGES = "mini/imessage/messages"

@@ -7,7 +7,3 @@ class M0usuNetError(Exception):
 
 class RelayError(M0usuNetError):
     """Relay subprocess failed."""
-
-
-class ContactNotFoundError(M0usuNetError):
-    """Contact lookup failed."""

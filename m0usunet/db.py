@@ -266,10 +266,6 @@ def search_contacts(conn: sqlite3.Connection, query: str) -> list[Contact]:
     return [Contact(**dict(r)) for r in rows]
 
 
-def all_contacts(conn: sqlite3.Connection) -> list[Contact]:
-    rows = conn.execute("SELECT * FROM contacts ORDER BY display_name").fetchall()
-    return [Contact(**dict(r)) for r in rows]
-
 
 def import_tsv(path: Path) -> int:
     """Import contacts from a name\\tphone TSV file. Returns count imported."""
