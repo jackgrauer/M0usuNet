@@ -178,7 +178,7 @@ class ConversationSummary(BaseModel):
 _shared_conn: sqlite3.Connection | None = None
 
 
-def _init_conn(timeout: float = 5.0) -> sqlite3.Connection:
+def _init_conn(timeout: float = 30.0) -> sqlite3.Connection:
     conn = sqlite3.connect(str(DB_PATH), timeout=timeout, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode = WAL")
@@ -188,7 +188,7 @@ def _init_conn(timeout: float = 5.0) -> sqlite3.Connection:
 
 
 @contextmanager
-def get_connection(timeout: float = 5.0) -> Generator[sqlite3.Connection, None, None]:
+def get_connection(timeout: float = 30.0) -> Generator[sqlite3.Connection, None, None]:
     """Get a shared read-write connection to the m0usunet database.
 
     Reuses a single connection (WAL mode is safe for concurrent reads).
@@ -198,6 +198,9 @@ def get_connection(timeout: float = 5.0) -> Generator[sqlite3.Connection, None, 
         _shared_conn = _init_conn(timeout)
     try:
         yield _shared_conn
+    except sqlite3.OperationalError:
+        # Lock contention — connection is fine, just re-raise
+        raise
     except Exception:
         # Connection broken — reset and re-raise
         _shared_conn = None
