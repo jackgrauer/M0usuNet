@@ -551,6 +551,24 @@ def get_all_scheduled(conn: sqlite3.Connection, include_done: bool = False) -> l
     return [dict(r) for r in rows]
 
 
+def update_scheduled(
+    conn: sqlite3.Connection, sched_id: int,
+    body: str | None = None, scheduled_at: str | None = None,
+) -> bool:
+    """Update body and/or scheduled_at of a pending message. Returns True if updated."""
+    row = conn.execute(
+        "SELECT status FROM scheduled_messages WHERE id = ?", (sched_id,)
+    ).fetchone()
+    if not row or row["status"] != "pending":
+        return False
+    if body is not None:
+        conn.execute("UPDATE scheduled_messages SET body = ? WHERE id = ?", (body, sched_id))
+    if scheduled_at is not None:
+        conn.execute("UPDATE scheduled_messages SET scheduled_at = ? WHERE id = ?", (scheduled_at, sched_id))
+    conn.commit()
+    return True
+
+
 def cancel_scheduled_by_id(conn: sqlite3.Connection, sched_id: int) -> bool:
     """Cancel a single scheduled message by id. Returns True if cancelled."""
     cur = conn.execute(
