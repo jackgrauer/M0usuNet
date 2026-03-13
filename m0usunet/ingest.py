@@ -6,6 +6,9 @@ thread started by the TUI on mount.
 Mac Mini iMessage and Pixel SMS are both ingested via MQTT push from
 their respective daemons. Uses paho-mqtt in-process with QoS 1 and
 persistent sessions so the broker buffers messages during downtime.
+
+v0.3.0: integrated rate limiting, hooks, heartbeats, mesh routing,
+and message signing.
 """
 
 import json
@@ -20,11 +23,13 @@ from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
-from .constants import ATTACHMENTS_DIR
+from .constants import ATTACHMENTS_DIR, NODE_ID, NODE_KEY_PATH
 from .db import (
     get_connection, upsert_contact, add_message_with_guid,
     add_attachment, update_attachment_status,
 )
+from .hooks import run_hooks
+from .ratelimit import RateLimiter
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +46,44 @@ MQTT_CLIENT_ID = "m0usunet-daemon"
 TOPIC_MINI_MESSAGES = "mini/imessage/messages"
 TOPIC_PIXEL_MESSAGES = "pixel/sms/messages"
 TOPIC_REPLAY_REQUEST = "cmd/mini/imessage/replay"
+
+# Rate limiter: 10 burst, 2/s sustained per topic
+_limiter = RateLimiter(rate=2.0, burst=10)
+
+# Signing — lazy-loaded
+_private_key = None
+_trusted_keys: dict = {}
+
+
+def _get_private_key():
+    """Lazy-load the node's Ed25519 private key."""
+    global _private_key
+    if _private_key is None:
+        try:
+            from .signing import load_private_key
+            _private_key = load_private_key(NODE_KEY_PATH)
+            log.info("Loaded Ed25519 key from %s", NODE_KEY_PATH)
+        except Exception:
+            log.warning("Ed25519 key not available — signing disabled", exc_info=True)
+    return _private_key
+
+
+def _load_trusted_keys():
+    """Load public keys for known mesh nodes from DB."""
+    global _trusted_keys
+    try:
+        from .signing import load_public_key
+        with get_connection() as conn:
+            rows = conn.execute(
+                "SELECT node_id, public_key FROM mesh_nodes WHERE public_key IS NOT NULL"
+            ).fetchall()
+        for row in rows:
+            try:
+                _trusted_keys[row["node_id"]] = load_public_key(row["public_key"].encode())
+            except Exception:
+                log.debug("Failed to load key for node %s", row["node_id"])
+    except Exception:
+        log.debug("Could not load trusted keys", exc_info=True)
 
 
 def _epoch_ms_to_iso(ms: int) -> str:
@@ -162,6 +205,11 @@ def _download_attachment(att_id: int, contact_id: int, remote_path: str, filenam
 
 def _handle_mini_msg(payload: bytes) -> None:
     """Process a message from mini/imessage/messages."""
+    # Rate limit
+    if not _limiter.allow("mini"):
+        log.warning("Rate limited: mini topic")
+        return
+
     try:
         msg = json.loads(payload)
     except (json.JSONDecodeError, ValueError):
@@ -191,6 +239,15 @@ def _handle_mini_msg(payload: bytes) -> None:
     direction = "out" if msg.get("is_from_me", False) else "in"
     guid = f"mini:{msg.get('guid', '')}"
     sent_at = msg.get("sent_at_iso", "")
+
+    # Run on_receive hooks
+    hook_msg = {
+        "source": "mini", "platform": platform, "direction": direction,
+        "contact_id": contact_id, "body": text, "handle_id": handle_id,
+    }
+    if not run_hooks("on_receive", hook_msg):
+        log.info("Message dropped by on_receive hook: %s", text[:40])
+        return
 
     with get_connection() as conn:
         added = add_message_with_guid(
@@ -240,6 +297,11 @@ def _handle_mini_msg(payload: bytes) -> None:
 
 def _handle_pixel_msg(payload: bytes) -> None:
     """Process a message from pixel/sms/messages."""
+    # Rate limit
+    if not _limiter.allow("pixel"):
+        log.warning("Rate limited: pixel topic")
+        return
+
     try:
         msg = json.loads(payload)
     except (json.JSONDecodeError, ValueError):
@@ -261,6 +323,15 @@ def _handle_pixel_msg(payload: bytes) -> None:
     direction = "out" if is_from_me else "in"
     sent_at = _epoch_ms_to_iso(ts_ms) if ts_ms else ""
     guid = f"pixel:{msg_id}"
+
+    # Run on_receive hooks
+    hook_msg = {
+        "source": "pixel", "platform": "sms", "direction": direction,
+        "contact_id": contact_id, "body": text, "phone": phone,
+    }
+    if not run_hooks("on_receive", hook_msg):
+        log.info("Message dropped by on_receive hook: %s", text[:40])
+        return
 
     with get_connection() as conn:
         added = add_message_with_guid(
@@ -310,9 +381,19 @@ def _create_mqtt_client() -> mqtt.Client:
             log.info("MQTT connected (session_present=%s)", flags.session_present)
             c.subscribe(TOPIC_MINI_MESSAGES, qos=1)
             c.subscribe(TOPIC_PIXEL_MESSAGES, qos=1)
+            # Mesh topics
+            from .heartbeat import TOPIC_HEARTBEAT_WILDCARD
+            from .mesh import TOPIC_ANNOUNCE
+            c.subscribe(TOPIC_HEARTBEAT_WILDCARD, qos=0)
+            c.subscribe(f"mesh/route/{NODE_ID}", qos=1)
+            c.subscribe(TOPIC_ANNOUNCE, qos=1)
             # If broker lost our session, request replay to catch up
             if not flags.session_present:
                 _request_replay(c)
+            # Announce mesh join
+            from .mesh import announce_join
+            from .transport import get_registry
+            announce_join(c, get_registry().available())
         else:
             log.warning("MQTT connect failed: %s", reason_code)
 
@@ -331,10 +412,36 @@ def _create_mqtt_client() -> mqtt.Client:
         except Exception:
             log.exception("Error handling Pixel message")
 
+    def on_heartbeat(c, userdata, msg):
+        try:
+            from .heartbeat import handle_heartbeat
+            handle_heartbeat(msg.payload)
+        except Exception:
+            log.debug("Error handling heartbeat", exc_info=True)
+
+    def on_mesh_route(c, userdata, msg):
+        try:
+            from .mesh import handle_routed_message
+            handle_routed_message(msg.payload)
+        except Exception:
+            log.exception("Error handling routed message")
+
+    def on_mesh_announce(c, userdata, msg):
+        try:
+            data = json.loads(msg.payload)
+            node = data.get("node", "?")
+            event = data.get("event", "?")
+            log.info("Mesh announce: %s %s", node, event)
+        except Exception:
+            pass
+
     client.on_connect = on_connect
     client.on_disconnect = on_disconnect
     client.message_callback_add(TOPIC_MINI_MESSAGES, on_mini)
     client.message_callback_add(TOPIC_PIXEL_MESSAGES, on_pixel)
+    client.message_callback_add("mesh/heartbeat/+", on_heartbeat)
+    client.message_callback_add(f"mesh/route/{NODE_ID}", on_mesh_route)
+    client.message_callback_add("mesh/announce", on_mesh_announce)
 
     return client
 
@@ -343,15 +450,32 @@ def _create_mqtt_client() -> mqtt.Client:
 
 def run_forever(interval: float = POLL_INTERVAL) -> None:
     """Blocking loop — paho-mqtt handles reconnection internally."""
-    log.info("Ingest daemon started")
+    log.info("Ingest daemon started (node=%s)", NODE_ID)
+
+    # Initialize signing
+    _get_private_key()
+    _load_trusted_keys()
+
     client = _create_mqtt_client()
 
     while True:
         try:
             client.connect(MQTT_BROKER, MQTT_PORT, keepalive=60)
+
+            # Start heartbeat publisher + stale sweeper
+            from .transport import get_registry
+            from .heartbeat import start_heartbeat_publisher, start_stale_sweeper
+            start_heartbeat_publisher(client, transports=get_registry().available())
+            start_stale_sweeper()
+
             client.loop_forever()
         except KeyboardInterrupt:
             log.info("Ingest daemon stopping")
+            from .mesh import announce_leave
+            try:
+                announce_leave(client)
+            except Exception:
+                pass
             client.disconnect()
             return
         except Exception:

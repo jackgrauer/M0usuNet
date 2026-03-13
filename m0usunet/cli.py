@@ -1,13 +1,15 @@
-"""CLI entrypoint: daemon (default), import-contacts, seed, ingest, link, sources, merge."""
+"""CLI entrypoint: daemon, import-contacts, seed, ingest, link, sources, merge, mesh, backup."""
 
 import argparse
+import json
 import logging
 import sys
 
-from .constants import CONTACTS_TSV, DB_PATH
+from .constants import CONTACTS_TSV, DB_PATH, HOOKS_DIR, NODE_ID
 from .db import (
     ensure_schema, get_connection, get_contact, get_contact_by_name,
-    import_tsv, search_contacts, upsert_contact,
+    import_tsv, search_contacts, set_alias, upsert_contact,
+    get_outbox_stats,
 )
 
 
@@ -19,6 +21,19 @@ def cmd_daemon(args: argparse.Namespace) -> None:
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
+    log = logging.getLogger("m0usunet")
+
+    # Initialize transports
+    from .transport import get_registry, IMessageTransport, SMSTransport
+    registry = get_registry()
+    registry.register(IMessageTransport())
+    registry.register(SMSTransport())
+    log.info("Transports: %s", registry.all_names())
+
+    # Ensure hooks directory exists
+    for event in ("on_receive", "on_send"):
+        (HOOKS_DIR / event).mkdir(parents=True, exist_ok=True)
+
     from .scheduler import start_background as start_scheduler
     start_scheduler(interval=30)
     from .ingest import run_forever
@@ -83,6 +98,30 @@ def cmd_seed(_args: argparse.Namespace) -> None:
             conn.commit()
 
     print(f"Seeded {len(convos)} conversations into {DB_PATH}")
+
+
+def cmd_contacts(args: argparse.Namespace) -> None:
+    """List all contacts, optionally filtered by a search term."""
+    ensure_schema()
+    with get_connection() as conn:
+        if args.query:
+            contacts = search_contacts(conn, args.query)
+        else:
+            rows = conn.execute(
+                "SELECT * FROM contacts ORDER BY display_name COLLATE NOCASE"
+            ).fetchall()
+            from .db import Contact
+            contacts = [Contact(**dict(r)) for r in rows]
+
+    if not contacts:
+        print("No contacts found.")
+        return
+
+    for c in contacts:
+        phone = c.phone or "-"
+        alias = f" [{c.alias}]" if c.alias else ""
+        print(f"  {c.id:4d}  {c.display_name:<25s} {phone}{alias}")
+    print(f"\n{len(contacts)} contacts")
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
@@ -197,6 +236,128 @@ def cmd_merge(args: argparse.Namespace) -> None:
     print(f"Merged: {source.display_name} -> {target.display_name} ({msg_count} messages moved)")
 
 
+def cmd_alias(args: argparse.Namespace) -> None:
+    """Set or clear a contact alias (codename)."""
+    ensure_schema()
+    contact = _find_contact(args.contact)
+    alias = args.alias if args.alias != "clear" else None
+
+    with get_connection() as conn:
+        set_alias(conn, contact.id, alias)
+
+    if alias:
+        print(f"Alias set: {contact.display_name} -> {alias}")
+    else:
+        print(f"Alias cleared for {contact.display_name}")
+
+
+def cmd_mesh(args: argparse.Namespace) -> None:
+    """Show mesh node status."""
+    ensure_schema()
+    from .heartbeat import get_mesh_status
+
+    nodes = get_mesh_status()
+    if not nodes:
+        print(f"No mesh nodes seen yet. This node: {NODE_ID}")
+        return
+
+    print(f"MESH STATUS (self: {NODE_ID})")
+    print(f"{'NODE':<16s} {'STATUS':<10s} {'UPTIME':<12s} {'QUEUE':<6s} {'VERSION':<10s} {'TRANSPORTS'}")
+    print("-" * 72)
+    for n in nodes:
+        uptime = n.get("uptime_s", 0)
+        if uptime > 86400:
+            up_str = f"{uptime // 86400}d {(uptime % 86400) // 3600}h"
+        elif uptime > 3600:
+            up_str = f"{uptime // 3600}h {(uptime % 3600) // 60}m"
+        else:
+            up_str = f"{uptime // 60}m {uptime % 60}s"
+
+        transports_raw = n.get("transports", "[]")
+        try:
+            transports = ", ".join(json.loads(transports_raw))
+        except (json.JSONDecodeError, TypeError):
+            transports = transports_raw
+
+        status = n.get("status", "?")
+        print(
+            f"{n['node_id']:<16s} {status:<10s} {up_str:<12s} "
+            f"{n.get('queue_depth', 0):<6d} {n.get('version', ''):<10s} {transports}"
+        )
+
+
+def cmd_outbox(args: argparse.Namespace) -> None:
+    """Show outbox status and stats."""
+    ensure_schema()
+    with get_connection() as conn:
+        stats = get_outbox_stats(conn)
+
+        # Show pending items
+        rows = conn.execute(
+            "SELECT o.*, c.display_name FROM outbox o "
+            "JOIN contacts c ON c.id = o.contact_id "
+            "WHERE o.status IN ('queued', 'sending') "
+            "ORDER BY o.priority DESC, o.created_at ASC LIMIT 20"
+        ).fetchall()
+
+    print("OUTBOX STATS")
+    print(f"  queued:  {stats.get('queued', 0)}")
+    print(f"  sending: {stats.get('sending', 0)}")
+    print(f"  sent:    {stats.get('sent', 0)}")
+    print(f"  failed:  {stats.get('failed', 0)}")
+
+    if rows:
+        print(f"\nPENDING ({len(rows)}):")
+        for r in rows:
+            r = dict(r)
+            print(
+                f"  #{r['id']} -> {r['display_name']} via {r['transport']} "
+                f"[attempt {r['attempts']}/{r['max_attempts']}] "
+                f"{r['body'][:50]}"
+            )
+
+
+def cmd_backup(args: argparse.Namespace) -> None:
+    """Create a database backup."""
+    ensure_schema()
+    from .backup import local_backup, remote_backup
+
+    if args.remote:
+        ok = remote_backup(remote_host=args.remote)
+        if ok:
+            print(f"Remote backup pushed to {args.remote}")
+        else:
+            print("Remote backup failed", file=sys.stderr)
+            sys.exit(1)
+    else:
+        path = local_backup(tag=args.tag or "manual")
+        print(f"Backup created: {path}")
+
+
+def cmd_keygen(args: argparse.Namespace) -> None:
+    """Generate or display the node's Ed25519 keypair."""
+    from .constants import NODE_KEY_PATH
+    from .signing import load_private_key, get_public_key_pem
+
+    private_key = load_private_key(NODE_KEY_PATH)
+    pub_pem = get_public_key_pem(private_key).decode()
+
+    print(f"Node ID:     {NODE_ID}")
+    print(f"Key path:    {NODE_KEY_PATH}")
+    print(f"Public key:\n{pub_pem}")
+
+    if args.register:
+        # Store our public key in mesh_nodes for other nodes to find
+        with get_connection() as conn:
+            conn.execute(
+                "INSERT INTO mesh_nodes (node_id, public_key) VALUES (?, ?) "
+                "ON CONFLICT(node_id) DO UPDATE SET public_key = excluded.public_key",
+                (NODE_ID, pub_pem),
+            )
+            conn.commit()
+        print(f"Public key registered in mesh_nodes for {NODE_ID}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="m0usunet", description="Headless messaging daemon")
     sub = parser.add_subparsers(dest="command")
@@ -209,6 +370,9 @@ def main() -> None:
 
     sub.add_parser("import-contacts", help="Import from ~/contacts.tsv")
     sub.add_parser("seed", help="Create test conversations")
+
+    contacts_parser = sub.add_parser("contacts", help="List all contacts")
+    contacts_parser.add_argument("query", nargs="?", default="", help="Optional search term")
 
     ingest_parser = sub.add_parser("ingest", help="Run ingest only (no scheduler)")
     ingest_parser.add_argument(
@@ -229,22 +393,43 @@ def main() -> None:
     merge_parser.add_argument("from_contact", help="Contact to merge FROM (will be deleted)")
     merge_parser.add_argument("into_contact", help="Contact to merge INTO (keeps this one)")
 
+    alias_parser = sub.add_parser("alias", help="Set a contact alias (codename)")
+    alias_parser.add_argument("contact", help="Contact name")
+    alias_parser.add_argument("alias", help="Alias to set (use 'clear' to remove)")
+
+    sub.add_parser("mesh", help="Show mesh node status")
+
+    outbox_parser = sub.add_parser("outbox", help="Show outbox status")
+
+    backup_parser = sub.add_parser("backup", help="Create a database backup")
+    backup_parser.add_argument("--remote", help="SCP to remote host (e.g. 'mini')")
+    backup_parser.add_argument("--tag", default="", help="Backup tag/label")
+
+    keygen_parser = sub.add_parser("keygen", help="Generate/display Ed25519 node key")
+    keygen_parser.add_argument("--register", action="store_true", help="Register public key in mesh_nodes")
+
     args = parser.parse_args()
 
     if args.command is None:
         parser.print_help()
         sys.exit(0)
-    elif args.command == "daemon":
-        cmd_daemon(args)
-    elif args.command == "import-contacts":
-        cmd_import_contacts(args)
-    elif args.command == "seed":
-        cmd_seed(args)
-    elif args.command == "ingest":
-        cmd_ingest(args)
-    elif args.command == "link":
-        cmd_link(args)
-    elif args.command == "sources":
-        cmd_sources(args)
-    elif args.command == "merge":
-        cmd_merge(args)
+
+    commands = {
+        "daemon": cmd_daemon,
+        "import-contacts": cmd_import_contacts,
+        "seed": cmd_seed,
+        "contacts": cmd_contacts,
+        "ingest": cmd_ingest,
+        "link": cmd_link,
+        "sources": cmd_sources,
+        "merge": cmd_merge,
+        "alias": cmd_alias,
+        "mesh": cmd_mesh,
+        "outbox": cmd_outbox,
+        "backup": cmd_backup,
+        "keygen": cmd_keygen,
+    }
+
+    handler = commands.get(args.command)
+    if handler:
+        handler(args)

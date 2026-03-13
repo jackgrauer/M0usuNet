@@ -109,6 +109,48 @@ MIGRATIONS: list[tuple[int, str]] = [
     (7, """
         ALTER TABLE contacts ADD COLUMN muted INTEGER DEFAULT 0;
     """),
+
+    # ── v0.3.0: mesh, outbox, signing ────────────────────
+
+    (8, """
+        -- Store-and-forward outbox with exponential backoff
+        CREATE TABLE outbox (
+            id INTEGER PRIMARY KEY,
+            contact_id INTEGER NOT NULL REFERENCES contacts(id),
+            body TEXT NOT NULL,
+            transport TEXT NOT NULL DEFAULT 'relay',
+            priority INTEGER DEFAULT 0,
+            attempts INTEGER DEFAULT 0,
+            max_attempts INTEGER DEFAULT 5,
+            next_retry_at TEXT DEFAULT (datetime('now')),
+            backoff_s INTEGER DEFAULT 30,
+            status TEXT DEFAULT 'queued'
+                CHECK (status IN ('queued','sending','sent','failed','cancelled')),
+            error TEXT,
+            created_at TEXT DEFAULT (datetime('now')),
+            sent_at TEXT,
+            relay_output TEXT
+        );
+        CREATE INDEX idx_outbox_pending
+            ON outbox(status, next_retry_at)
+            WHERE status IN ('queued', 'sending');
+
+        -- Mesh node health tracking
+        CREATE TABLE mesh_nodes (
+            node_id TEXT PRIMARY KEY,
+            status TEXT DEFAULT 'online'
+                CHECK (status IN ('online','degraded','offline')),
+            last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            uptime_s INTEGER DEFAULT 0,
+            version TEXT DEFAULT '',
+            transports TEXT DEFAULT '[]',
+            queue_depth INTEGER DEFAULT 0,
+            public_key TEXT
+        );
+
+        -- Contact aliases (codenames)
+        ALTER TABLE contacts ADD COLUMN alias TEXT;
+    """),
 ]
 
 
@@ -122,6 +164,7 @@ class Contact(BaseModel):
     last_viewed_at: Optional[datetime] = None
     pinned: bool = False
     muted: bool = False
+    alias: Optional[str] = None
 
 
 class Message(BaseModel):
@@ -158,6 +201,34 @@ class ScheduledMessage(BaseModel):
     last_error: Optional[str] = None
     created_at: Optional[datetime] = None
     sent_at: Optional[datetime] = None
+
+
+class OutboxMessage(BaseModel):
+    id: int
+    contact_id: int
+    body: str
+    transport: str = "relay"
+    priority: int = 0
+    attempts: int = 0
+    max_attempts: int = 5
+    next_retry_at: Optional[str] = None
+    backoff_s: int = 30
+    status: str = "queued"
+    error: Optional[str] = None
+    created_at: Optional[str] = None
+    sent_at: Optional[str] = None
+    relay_output: Optional[str] = None
+
+
+class MeshNode(BaseModel):
+    node_id: str
+    status: str = "online"
+    last_seen: Optional[datetime] = None
+    uptime_s: int = 0
+    version: str = ""
+    transports: str = "[]"
+    queue_depth: int = 0
+    public_key: Optional[str] = None
 
 
 class ConversationSummary(BaseModel):
@@ -260,14 +331,20 @@ def upsert_contact(conn: sqlite3.Connection, name: str, phone: str | None = None
 
 
 def search_contacts(conn: sqlite3.Connection, query: str) -> list[Contact]:
-    """Search contacts by display_name or phone using LIKE %query%."""
+    """Search contacts by display_name, alias, or phone using LIKE %query%."""
     pattern = f"%{query}%"
     rows = conn.execute(
-        "SELECT * FROM contacts WHERE display_name LIKE ? OR phone LIKE ? ORDER BY display_name",
-        (pattern, pattern),
+        "SELECT * FROM contacts WHERE display_name LIKE ? OR phone LIKE ? "
+        "OR alias LIKE ? ORDER BY display_name",
+        (pattern, pattern, pattern),
     ).fetchall()
     return [Contact(**dict(r)) for r in rows]
 
+
+def set_alias(conn: sqlite3.Connection, contact_id: int, alias: str | None) -> None:
+    """Set or clear a contact alias (codename)."""
+    conn.execute("UPDATE contacts SET alias = ? WHERE id = ?", (alias, contact_id))
+    conn.commit()
 
 
 def import_tsv(path: Path) -> int:
@@ -287,37 +364,6 @@ def import_tsv(path: Path) -> int:
             upsert_contact(conn, name, phone)
             count += 1
     return count
-
-
-def mark_viewed(conn: sqlite3.Connection, contact_id: int) -> None:
-    """Update last_viewed_at to now for a contact."""
-    conn.execute(
-        "UPDATE contacts SET last_viewed_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (contact_id,),
-    )
-    conn.commit()
-
-
-def toggle_pin(conn: sqlite3.Connection, contact_id: int) -> bool:
-    """Toggle pinned status for a contact. Returns new pinned state."""
-    row = conn.execute("SELECT pinned FROM contacts WHERE id = ?", (contact_id,)).fetchone()
-    if row:
-        new_val = 0 if row["pinned"] else 1
-        conn.execute("UPDATE contacts SET pinned = ? WHERE id = ?", (new_val, contact_id))
-        conn.commit()
-        return bool(new_val)
-    return False
-
-
-def toggle_mute(conn: sqlite3.Connection, contact_id: int) -> bool:
-    """Toggle muted status for a contact. Returns new muted state."""
-    row = conn.execute("SELECT muted FROM contacts WHERE id = ?", (contact_id,)).fetchone()
-    if row:
-        new_val = 0 if row["muted"] else 1
-        conn.execute("UPDATE contacts SET muted = ? WHERE id = ?", (new_val, contact_id))
-        conn.commit()
-        return bool(new_val)
-    return False
 
 
 # ── Messages ──────────────────────────────────────────────
@@ -399,53 +445,6 @@ def add_message_with_guid(
     return True
 
 
-def get_messages(
-    conn: sqlite3.Connection, contact_id: int, limit: int = 200
-) -> list[Message]:
-    """Get messages for a contact, oldest first."""
-    rows = conn.execute(
-        "SELECT * FROM messages WHERE contact_id = ? ORDER BY datetime(sent_at) ASC LIMIT ?",
-        (contact_id, limit),
-    ).fetchall()
-    return [Message(**dict(r)) for r in rows]
-
-
-def delete_messages_for_contact(conn: sqlite3.Connection, contact_id: int) -> int:
-    """Delete all messages for a contact. Returns count deleted."""
-    cur = conn.execute("DELETE FROM messages WHERE contact_id = ?", (contact_id,))
-    conn.commit()
-    return cur.rowcount
-
-
-def conversation_list(conn: sqlite3.Connection) -> list[ConversationSummary]:
-    """Get all conversations sorted by most recent message."""
-    rows = conn.execute("""
-        SELECT
-            c.id AS contact_id,
-            c.display_name,
-            c.phone,
-            m.platform,
-            m.body AS last_message,
-            m.sent_at AS last_time,
-            m.direction,
-            c.pinned,
-            c.muted,
-            (SELECT COUNT(*) FROM messages
-             WHERE contact_id = c.id AND direction = 'in'
-             AND sent_at > COALESCE(c.last_viewed_at, '1970-01-01')
-            ) AS unread_count
-        FROM contacts c
-        JOIN messages m ON m.id = (
-            SELECT id FROM messages
-            WHERE contact_id = c.id
-            ORDER BY datetime(sent_at) DESC
-            LIMIT 1
-        )
-        ORDER BY c.pinned DESC, datetime(m.sent_at) DESC
-    """).fetchall()
-    return [ConversationSummary(**dict(r)) for r in rows]
-
-
 # ── Attachments ──────────────────────────────────────────
 
 def add_attachment(
@@ -484,22 +483,108 @@ def update_attachment_status(
     conn.commit()
 
 
-def get_attachments_for_messages(
-    conn: sqlite3.Connection, message_ids: list[int],
-) -> dict[int, list[Attachment]]:
-    """Batch fetch attachments for a set of message ids."""
-    if not message_ids:
-        return {}
-    placeholders = ",".join("?" * len(message_ids))
+# ── Outbox (store-and-forward) ───────────────────────────
+
+BACKOFF_SCHEDULE = [30, 60, 300, 900, 3600]  # 30s, 1m, 5m, 15m, 1hr
+
+
+def enqueue_message(
+    conn: sqlite3.Connection,
+    contact_id: int,
+    body: str,
+    transport: str = "relay",
+    priority: int = 0,
+    max_attempts: int = 5,
+) -> int:
+    """Add a message to the outbox for reliable delivery. Returns outbox id."""
+    cur = conn.execute(
+        "INSERT INTO outbox (contact_id, body, transport, priority, max_attempts) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (contact_id, body, transport, priority, max_attempts),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_due_outbox(conn: sqlite3.Connection, limit: int = 20) -> list[OutboxMessage]:
+    """Get queued messages that are due for delivery."""
     rows = conn.execute(
-        f"SELECT * FROM attachments WHERE message_id IN ({placeholders}) ORDER BY id",
-        message_ids,
+        "SELECT * FROM outbox "
+        "WHERE status = 'queued' AND next_retry_at <= datetime('now') "
+        "ORDER BY priority DESC, created_at ASC "
+        "LIMIT ?",
+        (limit,),
     ).fetchall()
-    result: dict[int, list[Attachment]] = {}
-    for r in rows:
-        att = Attachment(**dict(r))
-        result.setdefault(att.message_id, []).append(att)
-    return result
+    return [OutboxMessage(**dict(r)) for r in rows]
+
+
+def mark_outbox_sending(conn: sqlite3.Connection, outbox_id: int) -> None:
+    """Mark an outbox message as currently being sent."""
+    conn.execute("UPDATE outbox SET status = 'sending' WHERE id = ?", (outbox_id,))
+    conn.commit()
+
+
+def mark_outbox_sent(
+    conn: sqlite3.Connection, outbox_id: int, relay_output: str = "",
+) -> None:
+    """Mark an outbox message as successfully sent."""
+    conn.execute(
+        "UPDATE outbox SET status = 'sent', sent_at = datetime('now'), "
+        "relay_output = ? WHERE id = ?",
+        (relay_output, outbox_id),
+    )
+    conn.commit()
+
+
+def mark_outbox_retry(
+    conn: sqlite3.Connection, outbox_id: int, error: str,
+) -> None:
+    """Increment attempts and schedule retry with exponential backoff."""
+    row = conn.execute(
+        "SELECT attempts, max_attempts FROM outbox WHERE id = ?", (outbox_id,)
+    ).fetchone()
+    if not row:
+        return
+
+    attempts = row["attempts"] + 1
+    if attempts >= row["max_attempts"]:
+        conn.execute(
+            "UPDATE outbox SET status = 'failed', attempts = ?, error = ? WHERE id = ?",
+            (attempts, error, outbox_id),
+        )
+    else:
+        backoff_idx = min(attempts - 1, len(BACKOFF_SCHEDULE) - 1)
+        backoff = BACKOFF_SCHEDULE[backoff_idx]
+        conn.execute(
+            "UPDATE outbox SET status = 'queued', attempts = ?, error = ?, "
+            "backoff_s = ?, next_retry_at = datetime('now', '+' || ? || ' seconds') "
+            "WHERE id = ?",
+            (attempts, error, backoff, str(backoff), outbox_id),
+        )
+    conn.commit()
+
+
+def cancel_outbox(conn: sqlite3.Connection, outbox_id: int) -> bool:
+    """Cancel a queued outbox message. Returns True if cancelled."""
+    cur = conn.execute(
+        "UPDATE outbox SET status = 'cancelled' WHERE id = ? AND status IN ('queued', 'sending')",
+        (outbox_id,),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_outbox_stats(conn: sqlite3.Connection) -> dict:
+    """Get outbox statistics."""
+    row = conn.execute(
+        "SELECT "
+        "  SUM(CASE WHEN status = 'queued' THEN 1 ELSE 0 END) AS queued, "
+        "  SUM(CASE WHEN status = 'sending' THEN 1 ELSE 0 END) AS sending, "
+        "  SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent, "
+        "  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed "
+        "FROM outbox"
+    ).fetchone()
+    return dict(row) if row else {}
 
 
 # ── Scheduled Messages ───────────────────────────────────
@@ -524,6 +609,23 @@ def get_pending_scheduled(conn: sqlite3.Connection) -> list[ScheduledMessage]:
         "ORDER BY scheduled_at ASC",
     ).fetchall()
     return [ScheduledMessage(**dict(r)) for r in rows]
+
+
+def mark_scheduled_sent(conn: sqlite3.Connection, sched_id: int) -> None:
+    conn.execute(
+        "UPDATE scheduled_messages SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (sched_id,),
+    )
+    conn.commit()
+
+
+def mark_scheduled_failed(conn: sqlite3.Connection, sched_id: int, error: str) -> None:
+    conn.execute(
+        "UPDATE scheduled_messages SET status = 'failed', last_error = ?, "
+        "attempts = attempts + 1 WHERE id = ?",
+        (error, sched_id),
+    )
+    conn.commit()
 
 
 def get_scheduled_for_contact(
@@ -606,18 +708,99 @@ def cancel_scheduled(conn: sqlite3.Connection, contact_id: int, cancel_all: bool
     return cur.rowcount
 
 
-def mark_scheduled_sent(conn: sqlite3.Connection, sched_id: int) -> None:
+# ── TUI queries (used by m0usubot) ──────────────────────
+
+def mark_viewed(conn: sqlite3.Connection, contact_id: int) -> None:
+    """Update last_viewed_at to now for a contact."""
     conn.execute(
-        "UPDATE scheduled_messages SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (sched_id,),
+        "UPDATE contacts SET last_viewed_at = CURRENT_TIMESTAMP WHERE id = ?",
+        (contact_id,),
     )
     conn.commit()
 
 
-def mark_scheduled_failed(conn: sqlite3.Connection, sched_id: int, error: str) -> None:
-    conn.execute(
-        "UPDATE scheduled_messages SET status = 'failed', last_error = ?, "
-        "attempts = attempts + 1 WHERE id = ?",
-        (error, sched_id),
-    )
+def toggle_pin(conn: sqlite3.Connection, contact_id: int) -> bool:
+    """Toggle pinned status for a contact. Returns new pinned state."""
+    row = conn.execute("SELECT pinned FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+    if row:
+        new_val = 0 if row["pinned"] else 1
+        conn.execute("UPDATE contacts SET pinned = ? WHERE id = ?", (new_val, contact_id))
+        conn.commit()
+        return bool(new_val)
+    return False
+
+
+def toggle_mute(conn: sqlite3.Connection, contact_id: int) -> bool:
+    """Toggle muted status for a contact. Returns new muted state."""
+    row = conn.execute("SELECT muted FROM contacts WHERE id = ?", (contact_id,)).fetchone()
+    if row:
+        new_val = 0 if row["muted"] else 1
+        conn.execute("UPDATE contacts SET muted = ? WHERE id = ?", (new_val, contact_id))
+        conn.commit()
+        return bool(new_val)
+    return False
+
+
+def get_messages(
+    conn: sqlite3.Connection, contact_id: int, limit: int = 200
+) -> list[Message]:
+    """Get messages for a contact, oldest first."""
+    rows = conn.execute(
+        "SELECT * FROM messages WHERE contact_id = ? ORDER BY datetime(sent_at) ASC LIMIT ?",
+        (contact_id, limit),
+    ).fetchall()
+    return [Message(**dict(r)) for r in rows]
+
+
+def delete_messages_for_contact(conn: sqlite3.Connection, contact_id: int) -> int:
+    """Delete all messages for a contact. Returns count deleted."""
+    cur = conn.execute("DELETE FROM messages WHERE contact_id = ?", (contact_id,))
     conn.commit()
+    return cur.rowcount
+
+
+def conversation_list(conn: sqlite3.Connection) -> list[ConversationSummary]:
+    """Get all conversations sorted by most recent message."""
+    rows = conn.execute("""
+        SELECT
+            c.id AS contact_id,
+            c.display_name,
+            c.phone,
+            m.platform,
+            m.body AS last_message,
+            m.sent_at AS last_time,
+            m.direction,
+            c.pinned,
+            c.muted,
+            (SELECT COUNT(*) FROM messages
+             WHERE contact_id = c.id AND direction = 'in'
+             AND sent_at > COALESCE(c.last_viewed_at, '1970-01-01')
+            ) AS unread_count
+        FROM contacts c
+        JOIN messages m ON m.id = (
+            SELECT id FROM messages
+            WHERE contact_id = c.id
+            ORDER BY datetime(sent_at) DESC
+            LIMIT 1
+        )
+        ORDER BY c.pinned DESC, datetime(m.sent_at) DESC
+    """).fetchall()
+    return [ConversationSummary(**dict(r)) for r in rows]
+
+
+def get_attachments_for_messages(
+    conn: sqlite3.Connection, message_ids: list[int],
+) -> dict[int, list[Attachment]]:
+    """Batch fetch attachments for a set of message ids."""
+    if not message_ids:
+        return {}
+    placeholders = ",".join("?" * len(message_ids))
+    rows = conn.execute(
+        f"SELECT * FROM attachments WHERE message_id IN ({placeholders}) ORDER BY id",
+        message_ids,
+    ).fetchall()
+    result: dict[int, list[Attachment]] = {}
+    for r in rows:
+        att = Attachment(**dict(r))
+        result.setdefault(att.message_id, []).append(att)
+    return result
