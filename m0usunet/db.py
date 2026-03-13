@@ -151,6 +151,34 @@ MIGRATIONS: list[tuple[int, str]] = [
         -- Contact aliases (codenames)
         ALTER TABLE contacts ADD COLUMN alias TEXT;
     """),
+
+    (9, """
+        -- FTS5 full-text search on messages
+        CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+            body,
+            content='messages',
+            content_rowid='id',
+            tokenize='porter unicode61'
+        );
+
+        -- Populate FTS from existing messages
+        INSERT OR IGNORE INTO messages_fts(rowid, body)
+            SELECT id, body FROM messages WHERE body IS NOT NULL;
+
+        -- Triggers to keep FTS in sync
+        CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+            INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF body ON messages BEGIN
+            INSERT INTO messages_fts(messages_fts, rowid, body) VALUES('delete', old.id, old.body);
+            INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+        END;
+    """),
 ]
 
 
@@ -255,6 +283,7 @@ def _init_conn(timeout: float = 30.0) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode = WAL")
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)}")
+    conn.execute("PRAGMA mmap_size = 268435456")  # 256MB mmap
     return conn
 
 
@@ -750,6 +779,23 @@ def get_messages(
         (contact_id, limit),
     ).fetchall()
     return [Message(**dict(r)) for r in rows]
+
+
+def search_messages(
+    conn: sqlite3.Connection, query: str, limit: int = 50
+) -> list[dict]:
+    """Full-text search across all messages using FTS5."""
+    rows = conn.execute("""
+        SELECT m.*, c.display_name, c.phone,
+               snippet(messages_fts, 0, '>>>', '<<<', '...', 20) AS snippet
+        FROM messages_fts fts
+        JOIN messages m ON m.id = fts.rowid
+        JOIN contacts c ON c.id = m.contact_id
+        WHERE messages_fts MATCH ?
+        ORDER BY rank
+        LIMIT ?
+    """, (query, limit)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def delete_messages_for_contact(conn: sqlite3.Connection, contact_id: int) -> int:
